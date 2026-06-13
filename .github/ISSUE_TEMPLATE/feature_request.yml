@@ -1,0 +1,38 @@
+name: Feature Request
+description: Suggest an enhancement or new capability
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What forensic or operational need does this address?
+      placeholder: When investigating X, the tool can't currently...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or option you'd like.
+    validations:
+      required: true
+  - type: dropdown
+    id: schema-impact
+    attributes:
+      label: Does this change the event field contract?
+      description: Adding/renaming/reordering event fields affects the EvtxECmd maps and SIEM parsing.
+      options:
+        - "No — does not touch event fields"
+        - "Yes — adds a field (MINOR schema bump)"
+        - "Yes — renames/removes/reorders fields (MAJOR schema bump)"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
