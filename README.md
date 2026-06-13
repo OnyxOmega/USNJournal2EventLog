@@ -282,5 +282,4 @@ Directory and packaged-executable options. In brief:
 
 ## License
 
-Choose a license before publishing (e.g. MIT or Apache-2.0) and add a `LICENSE`
-file. Without one, the default is "all rights reserved," which discourages reuse.
+Found at **[LICENSE](LICENSE)**
