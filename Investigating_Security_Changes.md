@@ -17,7 +17,7 @@ Audit Logs: If Object Access Auditing (e.g., Event ID 4670) is enabled in your L
 or Group Policy, Windows will explicitly log the specific permissions that were changed, detailing
 the Old SD (Security Descriptor) and New SD in the Event Viewer.
 
-##How to Analyze the Security Change
+## How to Analyze the Security Change
 If you want to investigate the USN entry itself using forensic tools to confirm a permission 
 change took place:
 
