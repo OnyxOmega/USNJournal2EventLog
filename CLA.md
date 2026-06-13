@@ -119,6 +119,8 @@ Date:             ______________________________________________
 Signature:        ______________________________________________
 ```
 
+Please email a pdf copy of this Signed CLA to Licensing@pfs.33mail.com
+
 *Adapted from the Apache Software Foundation Individual Contributor License
 Agreement (V2.0). A Corporate CLA is available on request for contributions made
 in the course of employment.*
