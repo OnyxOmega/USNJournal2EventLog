@@ -16,13 +16,6 @@ Usage
     python usn_monitor.py stop         # stop the service
     python usn_monitor.py remove       # uninstall the service
     python usn_monitor.py              # (no args) launch the configuration GUI
-    
-    Enable Verboses debugging
-    set USN_VERBOSE=1
-    python usn_monitor.py debug
-
-    Turn off Verbose debugging
-    set USN_VERBOSE=0
 """
 
 import os
@@ -625,28 +618,12 @@ def run_usn_engine(monitored_paths, should_stop):
         win32file.CloseHandle(h_vol)
 
 
-# Ordered EventData field contract. PARAM[1] is a human-readable summary (so the
-# Event Viewer / Event Log Explorer description stays readable via the message
-# DLL's "%1"); PARAM[2..] are the individual fields, each emitted as its own
-# insertion string so they extract positionally as {PARAM[N]}.
-#
-#   PARAM[1]  = Summary (one line)
-#   PARAM[2]  = SchemaVersion
-#   PARAM[3]  = Category
-#   PARAM[4]  = TargetFilename     (mirrors Sysmon)
-#   PARAM[5]  = UtcTime            (mirrors Sysmon)
-#   PARAM[6]  = Reason
-#   PARAM[7]  = Usn
-#   PARAM[8]  = JournalId
-#   PARAM[9]  = Hostname
-#   PARAM[10] = FQDN
-#   PARAM[11] = Domain
-#   PARAM[12] = MachineGuid
-#   PARAM[13] = MachineSID
-#   PARAM[14] = SourceIP
-#   PARAM[15] = MAC
-#   PARAM[16] = VolumeSerial
-#   PARAM[17] = OSBuild
+# EventData field contract. Classic ReportEvent events on a custom channel render
+# ALL insertion strings merged into a single <Data> node (the message template
+# only consumes %1 and appends leftovers), so we emit ONE clean "Key: value" block
+# as a single insertion string. Downstream tools extract fields by regex against
+# that block (see the EvtxECmd maps' Refine: lookbehind patterns). Named EventData
+# fields would require an instrumentation manifest (future Level-2 step).
 EVENT_FIELD_NAMES = [
     "SchemaVersion", "Category", "TargetFilename", "UtcTime", "Reason", "Usn",
     "JournalId", "Hostname", "FQDN", "Domain", "MachineGuid", "MachineSID",
@@ -654,10 +631,11 @@ EVENT_FIELD_NAMES = [
 ]
 
 
-def _build_event_strings(category, target_filename, utc_time, rec, host_ctx):
-    """Return the list of insertion strings for ReportEvent. Index 0 is a
-    readable summary; indices 1.. are the individual field VALUES in
-    EVENT_FIELD_NAMES order (so they map to {PARAM[2]}.. positionally)."""
+def _build_event_message(category, target_filename, utc_time, rec, host_ctx):
+    """Return a single 'Key: value' block (one insertion string). Each field is on
+    its own line so a lookbehind regex like '(?<=Usn: )[0-9]+' extracts it cleanly.
+    Field names mirror Sysmon where they are correlation keys (TargetFilename,
+    UtcTime)."""
     values = {
         "SchemaVersion": SCHEMA_VERSION,
         "Category": category,
@@ -676,12 +654,7 @@ def _build_event_strings(category, target_filename, utc_time, rec, host_ctx):
         "VolumeSerial": host_ctx.get("VolumeSerial", ""),
         "OSBuild": host_ctx.get("OSBuild", ""),
     }
-    summary = "%s  %s  (UTC %s)" % (category, target_filename, utc_time)
-    ordered_values = [values[name] for name in EVENT_FIELD_NAMES]
-    # Full readable block as the summary so the description tab is still useful.
-    readable = summary + "\n" + "\n".join(
-        "%s: %s" % (name, values[name]) for name in EVENT_FIELD_NAMES)
-    return [readable] + ordered_values
+    return "\n".join("%s: %s" % (name, values[name]) for name in EVENT_FIELD_NAMES)
 
 
 def _handle_record(buf, offset, resolver, monitored, stats, host_ctx):
@@ -719,11 +692,11 @@ def _handle_record(buf, offset, resolver, monitored, stats, host_ctx):
         category = "RangeChange"
         utc_time = now_utc_str()
 
-    strings = _build_event_strings(category, target_filename, utc_time, rec, host_ctx)
+    msg = _build_event_message(category, target_filename, utc_time, rec, host_ctx)
     win32evtlogutil.ReportEvent(
         SOURCE_NAME, event_id,
         eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE,
-        strings=strings)
+        strings=[msg])
     stats["emitted"] += 1
 
 
