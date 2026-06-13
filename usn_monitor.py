@@ -618,24 +618,36 @@ def run_usn_engine(monitored_paths, should_stop):
         win32file.CloseHandle(h_vol)
 
 
-# EventData field contract. Classic ReportEvent events on a custom channel render
-# ALL insertion strings merged into a single <Data> node (the message template
-# only consumes %1 and appends leftovers), so we emit ONE clean "Key: value" block
-# as a single insertion string. Downstream tools extract fields by regex against
-# that block (see the EvtxECmd maps' Refine: lookbehind patterns). Named EventData
-# fields would require an instrumentation manifest (future Level-2 step).
+# EventData emission. EvtxECmd renders classic events via the message template,
+# collapsing insertion strings into one <Data> blob -> the EvtxECmd maps extract
+# fields by regex from that blob (PARAM[1]). Event Log Explorer instead reads the
+# raw insertion-strings array, so {PARAM[n]} needs SEPARATE strings. We therefore
+# emit the clean blob as PARAM[1] AND a short, fixed list of high-value fields as
+# PARAM[2..] for Event Log Explorer column extraction.
 EVENT_FIELD_NAMES = [
     "SchemaVersion", "Category", "TargetFilename", "UtcTime", "Reason", "Usn",
     "JournalId", "Hostname", "FQDN", "Domain", "MachineGuid", "MachineSID",
     "SourceIP", "MAC", "VolumeSerial", "OSBuild",
 ]
 
+# Fields exposed as separate insertion strings for Event Log Explorer {PARAM[n]}:
+#   PARAM[1] = full readable block (also used by EvtxECmd regex maps)
+#   PARAM[2] = Hostname
+#   PARAM[3] = TargetFilename
+#   PARAM[4] = UtcTime
+#   PARAM[5] = MachineGuid
+#   PARAM[6] = SourceIP
+#   PARAM[7] = VolumeSerial
+PARAM_FIELDS = [
+    "Hostname", "TargetFilename", "UtcTime", "MachineGuid", "SourceIP", "VolumeSerial",
+]
 
-def _build_event_message(category, target_filename, utc_time, rec, host_ctx):
-    """Return a single 'Key: value' block (one insertion string). Each field is on
-    its own line so a lookbehind regex like '(?<=Usn: )[0-9]+' extracts it cleanly.
-    Field names mirror Sysmon where they are correlation keys (TargetFilename,
-    UtcTime)."""
+
+def _build_event_strings(category, target_filename, utc_time, rec, host_ctx):
+    """Return insertion strings: [ readable_blob, <PARAM_FIELDS values...> ].
+    The blob (index 0) carries all fields as 'Key: value' lines for EvtxECmd regex
+    maps and the readable description; indices 1.. are the PARAM_FIELDS values for
+    Event Log Explorer's {PARAM[2..]}."""
     values = {
         "SchemaVersion": SCHEMA_VERSION,
         "Category": category,
@@ -654,7 +666,9 @@ def _build_event_message(category, target_filename, utc_time, rec, host_ctx):
         "VolumeSerial": host_ctx.get("VolumeSerial", ""),
         "OSBuild": host_ctx.get("OSBuild", ""),
     }
-    return "\n".join("%s: %s" % (name, values[name]) for name in EVENT_FIELD_NAMES)
+    blob = "\n".join("%s: %s" % (name, values[name]) for name in EVENT_FIELD_NAMES)
+    extras = [values[name] for name in PARAM_FIELDS]
+    return [blob] + extras
 
 
 def _handle_record(buf, offset, resolver, monitored, stats, host_ctx):
@@ -692,11 +706,11 @@ def _handle_record(buf, offset, resolver, monitored, stats, host_ctx):
         category = "RangeChange"
         utc_time = now_utc_str()
 
-    msg = _build_event_message(category, target_filename, utc_time, rec, host_ctx)
+    strings = _build_event_strings(category, target_filename, utc_time, rec, host_ctx)
     win32evtlogutil.ReportEvent(
         SOURCE_NAME, event_id,
         eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE,
-        strings=[msg])
+        strings=strings)
     stats["emitted"] += 1
 
 
