@@ -100,6 +100,42 @@ Get-WinEvent -FilterHashtable @{LogName='FileSystem'; StartTime=(Get-Date).AddHo
 
 ---
 
+## EventData fields (`{PARAM[n]}` reference)
+
+Each event is emitted with positional insertion strings. In Event Log Explorer
+(or any tool using positional `EventData`), extract a field as a custom column
+with `{PARAM[n]}`, using the index below.
+
+> `{PARAM[1]}` is a human-readable summary so the description tab stays useful;
+> the individual fields begin at `{PARAM[2]}`. Positional indices are part of the
+> event field contract (`SchemaVersion`) — a **MAJOR** schema bump is required if
+> they ever change.
+
+| Index | Field | Notes |
+|-------|-------|-------|
+| `{PARAM[1]}` | Summary | One-line summary + full readable field block |
+| `{PARAM[2]}` | SchemaVersion | Field-contract version (e.g. `1.0`) |
+| `{PARAM[3]}` | Category | Create / Modify / Delete / Rename / SecurityChange / Other / RangeChange |
+| `{PARAM[4]}` | TargetFilename | Full path (mirrors Sysmon — correlation key) |
+| `{PARAM[5]}` | UtcTime | `YYYY-MM-DD HH:MM:SS.fff` (mirrors Sysmon — correlation key) |
+| `{PARAM[6]}` | Reason | Full USN reason string (all flags) |
+| `{PARAM[7]}` | Usn | USN sequence number (ordering primitive) |
+| `{PARAM[8]}` | JournalId | USN journal ID (detects journal resets) |
+| `{PARAM[9]}` | Hostname | Source host name |
+| `{PARAM[10]}` | FQDN | Fully qualified domain name |
+| `{PARAM[11]}` | Domain | DNS domain |
+| `{PARAM[12]}` | MachineGuid | Stable machine identifier |
+| `{PARAM[13]}` | MachineSID | Machine SID (best-effort) |
+| `{PARAM[14]}` | SourceIP | IP address(es) at service start |
+| `{PARAM[15]}` | MAC | Primary MAC address |
+| `{PARAM[16]}` | VolumeSerial | NTFS volume serial (`XXXX-XXXX`) |
+| `{PARAM[17]}` | OSBuild | OS version/build |
+
+**Note:** these `EventData` elements are *positional and unnamed* (a limitation of
+classic event reporting), so `{EventData\Usn}`-style **named** lookups do **not**
+work — use the positional `{PARAM[n]}` indices above. Named-field access requires
+the instrumentation-manifest build (planned).
+
 ## Selecting paths to monitor
 
 Run `python usn_monitor.py` with no arguments to open the configuration GUI:
@@ -243,5 +279,4 @@ Directory and packaged-executable options. In brief:
 
 ## License
 
-Choose a license before publishing (e.g. MIT or Apache-2.0) and add a `LICENSE`
-file. Without one, the default is "all rights reserved," which discourages reuse.
+See LICENSE file for current LICENSE used for this project.
