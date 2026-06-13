@@ -99,7 +99,46 @@ Get-WinEvent -FilterHashtable @{LogName='FileSystem'; StartTime=(Get-Date).AddHo
 > write. This is the intended forensic granularity.
 
 ---
+## EventData fields (`{PARAM[n]}` reference)
 
+Each event carries a full human-readable field block as `{PARAM[1]}`, plus six
+high-value fields as separate insertion strings for column extraction in **Event
+Log Explorer** (or any tool using positional `EventData`). Extract a field as a
+custom column with `{PARAM[n]}`, using the index below.
+
+> `{PARAM[1]}` is the complete `Key: value` block (all 16 fields), so the
+> description tab stays fully readable. The six broken-out fields begin at
+> `{PARAM[2]}`. These indices are part of the event field contract
+> (`SchemaVersion`) — a **MAJOR** schema bump is required if they ever change.
+
+| Index | Field | Notes |
+|-------|-------|-------|
+| `{PARAM[1]}` | Full block | All 16 fields as `Key: value` lines (readable description + EvtxECmd regex source) |
+| `{PARAM[2]}` | Hostname | Source host name |
+| `{PARAM[3]}` | TargetFilename | Full path (mirrors Sysmon — correlation key) |
+| `{PARAM[4]}` | UtcTime | `YYYY-MM-DD HH:MM:SS.fff` (mirrors Sysmon — correlation key) |
+| `{PARAM[5]}` | MachineGuid | Stable machine identifier |
+| `{PARAM[6]}` | SourceIP | IP address(es) at service start |
+| `{PARAM[7]}` | VolumeSerial | NTFS volume serial (`XXXX-XXXX`) |
+
+**The remaining fields** (SchemaVersion, Category, Reason, Usn, JournalId, FQDN,
+Domain, MachineSID, MAC, OSBuild) are **not** broken out as separate `{PARAM[n]}`
+strings — they live inside the `{PARAM[1]}` block. Extract them there (Event Log
+Explorer supports regex against the description), or use the EvtxECmd maps, which
+pull every field from the block by regex into Timeline Explorer columns.
+
+**Two tools, two access methods (by design):**
+- **Event Log Explorer** reads the raw insertion-strings array → use `{PARAM[n]}`
+  above for the six broken-out fields.
+- **EvtxECmd → Timeline Explorer** renders to a single `Data` blob → the bundled
+  maps (`maps/`) regex-extract all fields into `PayloadData1–6` + `Computer`.
+
+**Note:** these `EventData` elements are *positional and unnamed* (a limitation of
+classic event reporting), so `{EventData\Usn}`-style **named** lookups do **not**
+work. Named-field access requires the instrumentation-manifest build (planned),
+which would also let every field become its own named column.
+
+---
 ## Selecting paths to monitor
 
 Run `python usn_monitor.py` with no arguments to open the configuration GUI:
