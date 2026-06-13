@@ -1,0 +1,229 @@
+Required Notice: Copyright (c) 2026 YASDC, Inc.
+
+================================================================================
+YASDC Source-Available Research & Education License 1.0.0
+(based on the PolyForm Noncommercial License 1.0.0, with modifications;
+ this is NOT the PolyForm Noncommercial License and is not endorsed by the
+ PolyForm Project)
+================================================================================
+
+PLAIN-LANGUAGE SUMMARY (not part of the legal terms)
+
+  FREE for: personal research/study/hobby use, and for academic research,
+  classroom instruction, and software verification -- but ONLY on systems
+  deployed specifically for those purposes (test/research systems), never on
+  the institution's operational/live systems, and never to process live data.
+
+  REQUIRES A PAID COMMERCIAL LICENSE for: any operational use, including
+  security monitoring, digital forensics, and incident response performed to
+  conduct, protect, defend, or investigate an organization's own systems,
+  networks, data, or operations -- regardless of the organization's nonprofit,
+  educational, governmental, or charitable status. See COMMERCIAL.md.
+
+================================================================================
+
+## Acceptance
+
+In order to get any license under these terms, you must agree to them as both
+strict obligations and conditions to all your licenses.
+
+## Copyright License
+
+The licensor grants you a copyright license for the software to do everything
+you might do with the software that would otherwise infringe the licensor's
+copyright in it for any Permitted Purpose. However, you may only distribute the
+software according to the Distribution License and make changes or new works
+based on the software according to the Changes and New Works License.
+
+## Distribution License
+
+The licensor grants you an additional copyright license to distribute copies of
+the software. Your license to distribute covers distributing the software with
+changes and new works permitted by the Changes and New Works License.
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part of the software from you
+also gets a copy of these terms, as well as copies of any plain-text lines
+beginning with `Required Notice:` that the licensor provided with the software.
+For example:
+
+> Required Notice: Copyright (c) 2026 YASDC, Inc.
+
+## Changes and New Works License
+
+The licensor grants you an additional copyright license to make changes and new
+works based on the software for any Permitted Purpose.
+
+## Patent License
+
+The licensor grants you a patent license for the software that covers patent
+claims the licensor can license, or becomes able to license, that you would
+infringe by using the software.
+
+## Permitted Purpose
+
+Subject to the Excluded Purpose section below, which controls over this section
+in the event of any conflict, each of the following is a Permitted Purpose:
+
+(a) **Personal Use.** Personal use for research, experiment, study, private
+    entertainment, hobby projects, or amateur pursuits, in each case without any
+    anticipated commercial application and without use on any Operational System
+    or processing of any Live Data.
+
+(b) **Research, Classroom Instruction, and Software Verification.** Academic or
+    scientific research, Classroom Instruction, and Software Verification,
+    provided that ALL such use occurs exclusively on one or more Test or Research
+    Systems and does not occur on any Operational System and does not process,
+    ingest, monitor, or analyze any Live Data.
+
+For clarity, the permissions in this section apply only while every condition of
+the applicable definition (including the Test or Research System conditions in
+the Definitions section) is satisfied. Use that begins as a Permitted Purpose but
+later fails any such condition ceases to be licensed under these terms at the time
+of that failure and requires a separate commercial license.
+
+## Excluded Purpose (Requires a Commercial License)
+
+Notwithstanding the Permitted Purpose section or any other grant in these terms,
+and regardless of whether the user is an individual, a for-profit entity, or any
+charitable, educational, public-research, public-safety, public-health,
+environmental, or governmental organization, the following are NOT permitted
+under this license and require a separate written commercial license from the
+licensor:
+
+(1) Use of the software for operational security monitoring, threat detection,
+    digital forensics, incident response, auditing, or investigation that is
+    performed to conduct, support, protect, defend, or investigate the systems,
+    networks, endpoints, data, services, personnel, or operations of any
+    organization, including the user's own institution;
+
+(2) Any use of the software on, or to monitor, an Operational System;
+
+(3) Any use of the software that stores, processes, ingests, transmits, monitors,
+    or analyzes Live Data; and
+
+(4) Any use of the software to conduct, fulfill, or otherwise complete
+    Institutional Operations.
+
+The nonprofit, educational, governmental, or charitable status of an organization,
+and the source of its funding, do not make an Excluded Purpose permitted.
+
+## Security Operations (Clarification)
+
+Research, experimentation, or testing carried out by a security operations center
+("SOC") or equivalent security function may itself be a normal function of that
+SOC. Such research, experimentation, or testing is a Permitted Purpose ONLY when
+all of the following are true: (i) it is conducted exclusively on Test or Research
+Systems; (ii) it is not conducted on, and does not monitor, any Operational System
+or any system used for live or normal operations; (iii) it does not process Live
+Data; and (iv) it satisfies the objective/deadline and teardown conditions in the
+definition of "Test or Research System." Any use of the software by a SOC or
+security function to monitor, defend, investigate, or respond on or for the
+organization's live or operational systems is an Excluded Purpose and requires a
+commercial license.
+
+## Fair Use
+
+You may have "fair use" rights for the software under the law. These terms do not
+limit them.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of your licenses to
+anyone else, or prevent the licensor from granting licenses to anyone else. These
+terms do not imply any other licenses.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or contributes to
+infringement of any patent, your patent license for the software granted under
+these terms ends immediately. If your company makes such a claim, your patent
+license ends immediately for work on behalf of your company.
+
+## Violations
+
+The first time you are notified in writing that you have violated any of these
+terms, or done anything with the software not covered by your licenses, your
+licenses can nonetheless continue if you come into full compliance with these
+terms, and take practical steps to correct past violations, within 32 days of
+receiving notice. Otherwise, all your licenses end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without any warranty or
+condition, and the licensor will not be liable to you for any damages arising out
+of these terms or the use or nature of the software, under any kind of legal
+claim.***
+
+## Definitions
+
+The **licensor** is the individual or entity offering these terms, and the
+**software** is the software the licensor makes available under these terms.
+
+**You** refers to the individual or entity agreeing to these terms.
+
+**Your company** is any legal entity, sole proprietorship, or other kind of
+organization that you work for, plus all organizations that have control over,
+are under the control of, or are under common control with that organization.
+**Control** means ownership of substantially all the assets of an entity, or the
+power to direct its management and policies by vote, contract, or otherwise.
+Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you for the software under
+these terms.
+
+**Use** means anything you do with the software requiring one of your licenses.
+
+**Classroom Instruction** means the delivery of educational instruction in the
+form of live in-person courses, synchronous virtual courses, or asynchronous
+virtual courses.
+
+**Institutional Operations** means the functions required to conduct, fulfill, or
+otherwise complete the normal operations of an institution or organization,
+including the operation, administration, security, and defense of the systems,
+networks, and data used to carry out those functions.
+
+**Operational System** means any physical or virtual system, device, endpoint,
+network, or service that is used (in whole or in part) to conduct, fulfill, or
+otherwise complete Institutional Operations, or that stores, processes, or
+transmits Live Data. Any system used for live or normal operations is an
+Operational System.
+
+**Live Data** means any data that originates from, is collected by, or is
+processed by an Operational System in the course of Institutional Operations,
+including production data and any data concerning real persons, systems, or
+events. Live Data does not include synthetic, fabricated, sample, or other data
+created solely for research, Classroom Instruction, or Software Verification.
+
+**Software Verification** means functional evaluation, validation, compatibility
+testing, or quality assurance of the software itself, conducted to confirm how
+the software behaves, and not deployed for the monitoring, defense, or
+investigation of any Operational System or Live Data.
+
+**Test or Research System** means a physical or virtual system deployed
+specifically and solely for research, Classroom Instruction, or Software
+Verification, that meets ALL of the following conditions:
+
+  (i)   it is not an Operational System and is not used for any live or normal
+        operations of any institution or organization;
+
+  (ii)  it does not store, process, ingest, transmit, monitor, or analyze any
+        Live Data;
+
+  (iii) it is established for a specific, documented research, instructional, or
+        verification objective and/or under a defined deadline or time period;
+        and
+
+  (iv)  it is decommissioned and torn down upon completion of the applicable
+        research, Classroom Instruction, or Software Verification objective or
+        upon expiration of the applicable deadline or time period, whichever
+        occurs first.
+
+================================================================================
+END OF LICENSE TERMS
+
+NOTE TO LICENSEES: This is a source-available license, not an open-source
+license. Commercial and operational use is restricted and requires a paid
+license. For commercial licensing, see COMMERCIAL.md or contact the licensor.
+================================================================================
