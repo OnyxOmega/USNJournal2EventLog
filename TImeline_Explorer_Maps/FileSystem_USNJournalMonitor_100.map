@@ -1,0 +1,57 @@
+Author: YASDC, Inc.
+Description: "USN: File Create"
+EventId: 100
+Channel: "FileSystem"
+Provider: "USNJournalMonitor"
+Maps:
+  -
+    Property: PayloadData1
+    PropertyValue: "%targetfilename%"
+    Values:
+      -
+        Name: targetfilename
+        Value: "/Event/EventData/Data[4]"
+  -
+    Property: PayloadData2
+    PropertyValue: "%category%"
+    Values:
+      -
+        Name: category
+        Value: "/Event/EventData/Data[3]"
+  -
+    Property: PayloadData3
+    PropertyValue: "%utctime%"
+    Values:
+      -
+        Name: utctime
+        Value: "/Event/EventData/Data[5]"
+  -
+    Property: PayloadData4
+    PropertyValue: "%reason%"
+    Values:
+      -
+        Name: reason
+        Value: "/Event/EventData/Data[6]"
+  -
+    Property: PayloadData5
+    PropertyValue: "Usn: %usn% | JournalId: %journalid%"
+    Values:
+      -
+        Name: usn
+        Value: "/Event/EventData/Data[7]"
+      -
+        Name: journalid
+        Value: "/Event/EventData/Data[8]"
+  -
+    Property: PayloadData6
+    PropertyValue: "IP: %sourceip% | VolSerial: %volserial% | Schema: %schema%"
+    Values:
+      -
+        Name: sourceip
+        Value: "/Event/EventData/Data[14]"
+      -
+        Name: volserial
+        Value: "/Event/EventData/Data[16]"
+      -
+        Name: schema
+        Value: "/Event/EventData/Data[2]"
