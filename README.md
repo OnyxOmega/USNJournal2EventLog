@@ -9,6 +9,9 @@ The service is headless, survives reboots, runs under `LocalSystem`, and
 self-manages its own rolling log archives so it can run unattended for long
 periods without filling the disk.
 
+--- 
+## Full Features List
+See full **[FEATURES LIST](FEATURES.md)**
 ---
 
 ## How it works
