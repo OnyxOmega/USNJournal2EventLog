@@ -1,0 +1,84 @@
+name: Bug Report
+description: Report a problem with the USN Journal Monitor
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report. Please do **not** use this
+        form for security vulnerabilities — see our Security Policy instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem, what you expected, and what actually occurred.
+      placeholder: Events stopped appearing in the FileSystem log after...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure roots: ...
+        2. Start the service / run debug
+        3. Create/modify a file in ...
+        4. Observe ...
+    validations:
+      required: true
+  - type: dropdown
+    id: filesystem
+    attributes:
+      label: Volume filesystem
+      options:
+        - NTFS
+        - ReFS
+        - Mixed / multiple drives
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: How was it running?
+      options:
+        - Installed Windows service
+        - Console debug mode (python usn_monitor.py debug)
+        - Configuration GUI
+    validations:
+      required: true
+  - type: input
+    id: windows-build
+    attributes:
+      label: Windows version / build
+      placeholder: "e.g. Windows 11 23H2 (22631) / Server 2022"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: monitor_config.json
+      description: Paste your config (redact sensitive paths). Note monitor_all, roots, and excludes.
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Diagnostic log
+      description: >
+        Relevant lines from C:\FileSystem_Archives\usn_monitor.log. For counter
+        stats, reproduce with the USN_VERBOSE environment variable set.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I am not reporting a security vulnerability (those go through the Security Policy).
+          required: true
+        - label: I tested on a disposable/VM host, not production.
+          required: false
