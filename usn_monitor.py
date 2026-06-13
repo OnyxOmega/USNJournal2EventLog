@@ -17,12 +17,12 @@ Usage
     python usn_monitor.py remove       # uninstall the service
     python usn_monitor.py              # (no args) launch the configuration GUI
     
-    Verbose Debug output:
-        set USN_VERBOSE=1
-        python usn_monitor.py debug
-        
-        when done
-        set USN_VERBOSE=0
+    Enable Verboses debugging
+    set USN_VERBOSE=1
+    python usn_monitor.py debug
+
+    Turn off Verbose debugging
+    set USN_VERBOSE=0
 """
 
 import os
@@ -625,31 +625,63 @@ def run_usn_engine(monitored_paths, should_stop):
         win32file.CloseHandle(h_vol)
 
 
-def _build_event_message(category, target_filename, utc_time, rec, host_ctx):
-    """Assemble the event body as KEY: value lines. Field names are chosen for
-    downstream consumption: TargetFilename and UtcTime mirror Sysmon (correlation
-    keys); the rest are our forensic enrichment. SchemaVersion versions the
-    contract. (Named ETW EventData fields are a future schema/manifest step;
-    these structured lines parse cleanly in the meantime.)"""
-    lines = [
-        "SchemaVersion: %s" % SCHEMA_VERSION,
-        "Category: %s" % category,
-        "TargetFilename: %s" % target_filename,
-        "UtcTime: %s" % utc_time,
-        "Reason: %s" % reason_text(rec.reason),
-        "Usn: %d" % rec.usn,
-        "JournalId: %s" % host_ctx.get("JournalId", ""),
-        "Hostname: %s" % host_ctx.get("Hostname", ""),
-        "FQDN: %s" % host_ctx.get("FQDN", ""),
-        "Domain: %s" % host_ctx.get("Domain", ""),
-        "MachineGuid: %s" % host_ctx.get("MachineGuid", ""),
-        "MachineSID: %s" % host_ctx.get("MachineSID", ""),
-        "SourceIP: %s" % host_ctx.get("SourceIP", ""),
-        "MAC: %s" % host_ctx.get("MAC", ""),
-        "VolumeSerial: %s" % host_ctx.get("VolumeSerial", ""),
-        "OSBuild: %s" % host_ctx.get("OSBuild", ""),
-    ]
-    return "\n".join(lines)
+# Ordered EventData field contract. PARAM[1] is a human-readable summary (so the
+# Event Viewer / Event Log Explorer description stays readable via the message
+# DLL's "%1"); PARAM[2..] are the individual fields, each emitted as its own
+# insertion string so they extract positionally as {PARAM[N]}.
+#
+#   PARAM[1]  = Summary (one line)
+#   PARAM[2]  = SchemaVersion
+#   PARAM[3]  = Category
+#   PARAM[4]  = TargetFilename     (mirrors Sysmon)
+#   PARAM[5]  = UtcTime            (mirrors Sysmon)
+#   PARAM[6]  = Reason
+#   PARAM[7]  = Usn
+#   PARAM[8]  = JournalId
+#   PARAM[9]  = Hostname
+#   PARAM[10] = FQDN
+#   PARAM[11] = Domain
+#   PARAM[12] = MachineGuid
+#   PARAM[13] = MachineSID
+#   PARAM[14] = SourceIP
+#   PARAM[15] = MAC
+#   PARAM[16] = VolumeSerial
+#   PARAM[17] = OSBuild
+EVENT_FIELD_NAMES = [
+    "SchemaVersion", "Category", "TargetFilename", "UtcTime", "Reason", "Usn",
+    "JournalId", "Hostname", "FQDN", "Domain", "MachineGuid", "MachineSID",
+    "SourceIP", "MAC", "VolumeSerial", "OSBuild",
+]
+
+
+def _build_event_strings(category, target_filename, utc_time, rec, host_ctx):
+    """Return the list of insertion strings for ReportEvent. Index 0 is a
+    readable summary; indices 1.. are the individual field VALUES in
+    EVENT_FIELD_NAMES order (so they map to {PARAM[2]}.. positionally)."""
+    values = {
+        "SchemaVersion": SCHEMA_VERSION,
+        "Category": category,
+        "TargetFilename": target_filename,
+        "UtcTime": utc_time,
+        "Reason": reason_text(rec.reason),
+        "Usn": str(rec.usn),
+        "JournalId": host_ctx.get("JournalId", ""),
+        "Hostname": host_ctx.get("Hostname", ""),
+        "FQDN": host_ctx.get("FQDN", ""),
+        "Domain": host_ctx.get("Domain", ""),
+        "MachineGuid": host_ctx.get("MachineGuid", ""),
+        "MachineSID": host_ctx.get("MachineSID", ""),
+        "SourceIP": host_ctx.get("SourceIP", ""),
+        "MAC": host_ctx.get("MAC", ""),
+        "VolumeSerial": host_ctx.get("VolumeSerial", ""),
+        "OSBuild": host_ctx.get("OSBuild", ""),
+    }
+    summary = "%s  %s  (UTC %s)" % (category, target_filename, utc_time)
+    ordered_values = [values[name] for name in EVENT_FIELD_NAMES]
+    # Full readable block as the summary so the description tab is still useful.
+    readable = summary + "\n" + "\n".join(
+        "%s: %s" % (name, values[name]) for name in EVENT_FIELD_NAMES)
+    return [readable] + ordered_values
 
 
 def _handle_record(buf, offset, resolver, monitored, stats, host_ctx):
@@ -687,11 +719,11 @@ def _handle_record(buf, offset, resolver, monitored, stats, host_ctx):
         category = "RangeChange"
         utc_time = now_utc_str()
 
-    msg = _build_event_message(category, target_filename, utc_time, rec, host_ctx)
+    strings = _build_event_strings(category, target_filename, utc_time, rec, host_ctx)
     win32evtlogutil.ReportEvent(
         SOURCE_NAME, event_id,
         eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE,
-        strings=[msg])
+        strings=strings)
     stats["emitted"] += 1
 
 
