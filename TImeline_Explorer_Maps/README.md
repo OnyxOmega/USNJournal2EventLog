@@ -65,14 +65,29 @@ OSBuild) remain available in the full **Payload** column.
    and user). USN catches changes Sysmon's minifilter can miss, and carries
    retroactive history, so the two together close gaps neither has alone.
 
-## Important: positional binding
+## Important: regex extraction from a single Data node
 
-These maps extract by **position** (`/Event/EventData/Data[N]`) because the current
-events use classic positional insertion strings. The positions are frozen by the
-event field contract (`SchemaVersion`). **If the field order in `usn_monitor.py`
-ever changes, bump `SchemaVersion` (MAJOR) and update the `Data[N]` indices in
-these maps to match.** A future instrumentation-manifest build would switch these
-to named bindings (`Data[@Name="Usn"]`); until then, keep the order stable.
+Classic `ReportEvent` events on a custom channel render **all** their content into
+a **single** `<Data>` element (there is no manifest defining separate named
+fields). So these maps do **not** use positional `Data[N]` — they use EvtxECmd's
+`Refine:` regex to pull each field out of the one `Data` blob.
+
+The agent emits each field as `Key: value` on its own line. Each map Value uses a
+**lookbehind** regex so the match excludes the `Key: ` prefix, e.g.:
+
+```yaml
+Name: usn
+Value: "/Event/EventData/Data"
+Refine: "(?<=Usn: )[0-9]+"
+```
+
+`.+` stops at the end of line (no Singleline), so multi-value fields like
+`SourceIP` (IPv6, IPv4) and `Reason` (`A + B`) are captured whole.
+
+If the field **order or names** in `usn_monitor.py` ever change, the `Key:` names
+the regexes anchor on must still match — the names are the contract (tracked by
+`SchemaVersion`). A future instrumentation-manifest build would replace these regex
+binds with native named `Data[@Name="..."]` lookups.
 
 ## Tip
 
