@@ -198,7 +198,7 @@ usnmon ships alongside two companion tools that analyze the archives it produces
 Both are self-contained Python scripts that only require `python-evtx` or the
 Rust `evtx` reader:
 
-- **`usn_stats.py` v0.2.0** — census/profiler. Single-file mode produces a full
+- **`\tools\usn_stats.py` v0.2.0** — census/profiler. Single-file mode produces a full
   per-archive report (run/throughput, event-ID frequency, top directories with
   recursive >40%-of-parent breakdown, extensions, temporal, resolution health,
   operational/device summary). **Series mode** (point it at a directory of
@@ -208,7 +208,7 @@ Rust `evtx` reader:
   capacity projection (fill time at observed rate vs. 1/3.5/5 GB targets), and
   per-archive comparison table.
 
-- **`usn_drill.py` v0.0.1** — targeted drill-down. Takes an archive + a filter
+- **`\tools\usn_drill.py` v0.0.1** — targeted drill-down. Takes an archive + a filter
   file of directory substrings (one per line, strict `\` terminator validation),
   produces a focused report scoped to the filter: throughput, event-ID mix,
   top directories (full depth), file extensions with event-type mix (C/M/D/R/S/O
@@ -217,6 +217,9 @@ Rust `evtx` reader:
   fastest-cycling files), resilient-files detection (state-journaling
   fingerprint), temporal/burst detection, per-instance inference
   (cam/camera/stream/channel/instance N regex), resolution health.
+
+- - **`\diag\*.py`** - misc. diagnostic scripts to help determine what is happening
+    within the usn_stats output. 
 
 ## Status
 
