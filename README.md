@@ -218,7 +218,7 @@ Rust `evtx` reader:
   fingerprint), temporal/burst detection, per-instance inference
   (cam/camera/stream/channel/instance N regex), resolution health.
 
-- - **`\diag\*.py`** - misc. diagnostic scripts to help determine what is happening
+- **`\diag\*.py`** - misc. diagnostic scripts to help determine what is happening
     within the usn_stats output. 
 
 ## Status
