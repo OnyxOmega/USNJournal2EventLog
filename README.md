@@ -1,7 +1,7 @@
 # usnmon — USN Journal Monitor
 
 **Continuous NTFS USN-journal recorder for Windows forensic monitoring.**
-Maintained by YASDC, Inc. · License: [PolyForm Noncommercial 1.0.0](LICENSE)
+Maintained by YASDC · License: [PolyForm Noncommercial 1.0.0](LICENSE)
 
 > **Supersedes [`usn_monitor.py`](old_srcs/).** The original directory-targeted
 > monitor is deprecated and preserved under [`old_srcs/`](old_srcs/) for reference.
