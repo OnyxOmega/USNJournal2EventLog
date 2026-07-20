@@ -1,24 +1,31 @@
-"""usn_common.py -- shared library for the USN Journal Monitor suite.
+"""usn_common.py -- shared library for the USN Journal Monitor.
 
-Imported by all three components (engine usn_monitor.py, the profiler/generator,
-and the drift comparator) so there is exactly ONE implementation of the matching,
-rule/crypto, stats, event-contract, and archive logic -- no duplication, no drift.
+v0.0.9: LEAN recording-side utilities. Signed-ruleset infrastructure, crypto,
+and archive helpers were extracted during the v0.0.9 architectural split.
+See the v0.0.9 extraction plan for the architectural rationale.
 
-Five libraries live here (see BLUEPRINT.md):
-  1. Matching        -- path normalization + the forwarding RuleMatcher
-  2. Rules / crypto  -- signed-JSON load, X.509 verify, validate, conflict-check
-  3. Stats           -- per-directory distribution + coverage math
-  4. Event contract  -- EventData field schema, classify, reason text
-  5. Archive         -- monthly bundle, EvtxECmd CSV, completeness, machine id
+Three libraries live here:
+  1. Event contract  -- EventData field schema, classify, reason text
+  2. Stats           -- per-directory distribution (usable by analytical tools)
+  3. Archive helpers -- machine id, EvtxECmd CSV wrapper (usable by analytical
+                        tools)
 
-Platform note: the crypto functions (verify_signature, get_cert_from_store) and the
-machine-id helpers use Windows APIs and CANNOT run on non-Windows. They are written
-against the `cryptography` package + Windows cert store and must be tested on the
-target. Everything else is pure-Python and portable (tested with `ntpath` for
-Windows path semantics).
+Removed during v0.0.9 extraction (see extraction plan for details):
+  - Archive management (check_archive_completeness, build_monthly_bundle) --
+    logmon now owns archive management.
+  - Signed-ruleset infrastructure (RuleMatcher, load_signed_ruleset,
+    merge_rulesets, validate_rules, detect_conflicts, sign_doc,
+    verify_signature, canonical_bytes, sha256_hex, get_cert_from_store,
+    compute_coverage, and their supporting constants) -- preserved locally in
+    signed_rulesets_reference.py for future analysis-side tooling. NOT
+    committed to any repository.
+
+Platform note: the machine-id helpers use Windows APIs and CANNOT run on
+non-Windows. They are written against Windows-specific facilities and must be
+tested on the target. Everything else is pure-Python and portable (tested with
+`ntpath` for Windows path semantics).
 """
 
-import base64
 import hashlib
 import json
 import math
@@ -29,121 +36,13 @@ import time
 import ctypes
 from collections import Counter, OrderedDict
 
-# Contract version. Event field order/names and the rule schema are frozen per
-# MAJOR. The EvtxECmd maps, the WEC Cookbook, and SIEM parsing all bind to this.
+# Contract version. Event field order/names are frozen per MAJOR. The EvtxECmd
+# maps, the WEC Cookbook, and SIEM parsing all bind to this.
 SCHEMA_VERSION = "2.1"   # 2.1: appended HiResUtc (epoch-ns) to end of blob; additive,
                          # blob-only, no PARAM/contract change. 2.0 maps still parse.
 
-# Reserved RuleID range for vendor (YASDC) forensic rules. Client files may not
-# write IDs in this range; the loader rejects any that do (event 908).
-FORENSIC_ID_MIN = 10001
-FORENSIC_ID_MAX = 10999
-
-# Rule list keys (all four use the same per-rule object schema).
-RULE_LISTS = ("includes", "include_contains", "exclude_contains", "excludes")
-
-# Per-rule required fields and how a missing/blank value is defaulted. `path` is
-# the only field with NO default -- a rule without a path is invalid and rejected.
-RULE_DEFAULTS = {
-    "reason": "[reason:MISSING] review required",
-    "added_by": "[added_by:UNKNOWN] manual edit",
-    "date": None,   # filled with today's date at load if blank
-}
-
-# Coverage-collapse threshold: predicted monitoring/forward coverage dropping more
-# than this many PERCENTAGE POINTS below the matured baseline raises event 905.
-COVERAGE_DROP_ALERT_PCT = 5.0
-
-
 # =========================================================================== #
-#  1. MATCHING -- path normalization + the forwarding RuleMatcher
-# =========================================================================== #
-def norm_path(p):
-    """Normalize a path for comparison (case- and separator-insensitive).
-    Uses ntpath so Windows drive-letter / backslash semantics apply everywhere."""
-    return ntpath.normcase(ntpath.normpath(p))
-
-
-def is_under(path_norm, base_norm):
-    """True if path_norm == base_norm or is a descendant of it (boundary-aware:
-    C:\\Windows does NOT match C:\\WindowsApps)."""
-    if path_norm == base_norm:
-        return True
-    base = base_norm if base_norm.endswith("\\") else base_norm + "\\"
-    return path_norm.startswith(base)
-
-
-def _frag(fragment):
-    """Normalize a substring fragment to be boundary-safe: lower-cased and wrapped
-    in exactly one leading + one trailing backslash, regardless of how the input
-    was written ('x', '\\x', 'x\\', '\\\\x\\\\' all -> '\\x\\'). The boundary
-    anchors mean '\\Edge\\User Data\\' cannot match '\\Edge\\User DataBackup\\'."""
-    f = fragment.replace("/", "\\").lower().strip("\\")
-    return "\\" + f + "\\"
-
-
-def matches_contains(path, fragment_norm):
-    """True if the boundary-anchored *fragment_norm* (already _frag()'d) appears in
-    *path*. We anchor the path the same way (lower + ensure trailing sep on the
-    directory) so a fragment ending in '\\' matches a directory boundary."""
-    p = path.replace("/", "\\").lower()
-    if not p.endswith("\\"):
-        p = p + "\\"
-    return fragment_norm in p
-
-
-def minimize_roots(paths):
-    """Collapse a set of paths so none is a descendant of another (a parent
-    subsumes its children). Returns a sorted list of the originals kept."""
-    items = sorted({norm_path(p): p for p in paths}.items())
-    kept, kept_norm = [], []
-    for pn, original in items:
-        if any(is_under(pn, k) for k in kept_norm):
-            continue
-        kept.append(original)
-        kept_norm.append(pn)
-    return sorted(kept)
-
-
-class RuleMatcher:
-    """Decide whether a path should be FORWARDED (to FileSystem-IR / SIEM).
-
-    IMPORTANT: collection is unconditional -- the engine always writes every event
-    to the ALL log. This matcher only gates the *forwarding* second-emit.
-
-    Evaluation is include-first short-circuit (first hit decides, cheapest path):
-        1. includes          (exact)     hit -> FORWARD
-        2. include_contains  (substring) hit -> FORWARD
-        3. exclude_contains  (substring) hit -> DO NOT FORWARD
-        4. excludes          (exact)     hit -> DO NOT FORWARD
-        5. (no hit)                            -> default_forward
-    Includes always win, including a deeper include under a broad exclude
-    (honeypot inside an otherwise-unforwarded tree).
-    """
-
-    def __init__(self, rules, default_forward=False):
-        # rules: dict of the four lists, each a list of {"path": ...} objects.
-        self.inc = [norm_path(r["path"]) for r in rules.get("includes", [])]
-        self.inc_c = [_frag(r["path"]) for r in rules.get("include_contains", [])]
-        self.exc_c = [_frag(r["path"]) for r in rules.get("exclude_contains", [])]
-        self.exc = [norm_path(r["path"]) for r in rules.get("excludes", [])]
-        self.default_forward = default_forward
-
-    def should_forward(self, path):
-        pn = norm_path(path)
-        if any(is_under(pn, i) for i in self.inc):
-            return True
-        if any(matches_contains(path, f) for f in self.inc_c):
-            return True
-        if any(matches_contains(path, f) for f in self.exc_c):
-            return False
-        if any(is_under(pn, e) for e in self.exc):
-            return False
-        return self.default_forward
-
-
-# =========================================================================== #
-#  4. EVENT CONTRACT -- field schema, classification, reason text
+#  1. EVENT CONTRACT -- field schema, classification, reason text
 #     (Frozen by SCHEMA_VERSION. EvtxECmd maps + WEC Cookbook bind to this.)
 # =========================================================================== #
 # Event IDs by change category.
@@ -326,7 +225,7 @@ def build_event_strings(values):
 
 
 # =========================================================================== #
-#  3. STATS -- per-directory distribution + coverage math
+#  2. STATS -- per-directory distribution
 # =========================================================================== #
 def parent_dir(path):
     """Directory portion of a Windows path (ntpath; works on any OS)."""
@@ -399,240 +298,8 @@ def top_directories(dir_counts, threshold):
                   reverse=True)
 
 
-def compute_coverage(current_counts, baseline_counts, matcher):
-    """Predict what % of the BASELINE directory population would still be FORWARDED
-    under the current *matcher*, for coverage-collapse detection. Coverage is
-    measured against the frozen baseline population (not the live, already-filtered
-    log) so an attacker can't poison the reference by clearing logs.
-
-    Returns (forwarded_pct, dropped_pct). A large drop vs the recorded baseline
-    coverage (see COVERAGE_DROP_ALERT_PCT) raises event 905."""
-    if not baseline_counts:
-        return (0.0, 100.0)
-    total = sum(baseline_counts.values())
-    forwarded = sum(cv for d, cv in baseline_counts.items()
-                    if matcher.should_forward(d))
-    pct = 100.0 * forwarded / total if total else 0.0
-    return (pct, 100.0 - pct)
-
-
 # =========================================================================== #
-#  2. RULES / CRYPTO -- signed-JSON load, X.509 verify, validate, conflicts
-# =========================================================================== #
-# A signed ruleset file is JSON with a top-level "signature" (base64) and a
-# "signed_by" (cert subject/thumbprint hint). The signature covers the
-# CANONICAL form of the file with "signature" removed -- see canonical_bytes().
-
-def canonical_bytes(doc):
-    """Return the deterministic byte form of a ruleset dict for signing/verifying.
-    The 'signature' field is excluded; keys are sorted; separators fixed; UTF-8.
-    Any whitespace/key-order change produces the SAME bytes, so cosmetic edits do
-    not break a signature but content changes do."""
-    d = {k: v for k, v in doc.items() if k != "signature"}
-    return json.dumps(d, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False).encode("utf-8")
-
-
-def sha256_hex(data):
-    """Hex SHA-256 of bytes (used for integrity baselines / change detection)."""
-    return hashlib.sha256(data).hexdigest()
-
-
-def verify_signature(doc, public_key):
-    """Verify doc['signature'] (base64) over canonical_bytes(doc) using an
-    X.509/CNG public key (RSA or ECDSA). Returns True/False. Raises nothing on a
-    bad signature -- a False return is the caller's 909 trigger.
-
-    *public_key* is a `cryptography` public-key object (from get_cert_from_store()
-    or a loaded PEM). Tested on Windows with certs from the cert store."""
-    sig_b64 = doc.get("signature")
-    if not sig_b64:
-        return False
-    try:
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
-        from cryptography.exceptions import InvalidSignature
-        signature = base64.b64decode(sig_b64)
-        data = canonical_bytes(doc)
-        if isinstance(public_key, rsa.RSAPublicKey):
-            public_key.verify(signature, data,
-                              padding.PKCS1v15(), hashes.SHA256())
-        elif isinstance(public_key, ec.EllipticCurvePublicKey):
-            public_key.verify(signature, data, ec.ECDSA(hashes.SHA256()))
-        else:
-            return False
-        return True
-    except InvalidSignature:
-        return False
-    except Exception:
-        return False
-
-
-def sign_doc(doc, private_key):
-    """Sign canonical_bytes(doc) and return the base64 signature. Used by the
-    profiler/generator and by signing utilities (NOT by the engine -- the engine
-    only verifies). Mirrors verify_signature()'s algorithm handling."""
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding, ec, rsa
-    data = canonical_bytes(doc)
-    if isinstance(private_key, rsa.RSAPrivateKey):
-        sig = private_key.sign(data, padding.PKCS1v15(), hashes.SHA256())
-    elif isinstance(private_key, ec.EllipticCurvePrivateKey):
-        sig = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
-    else:
-        raise TypeError("Unsupported key type for signing")
-    return base64.b64encode(sig).decode("ascii")
-
-
-def get_cert_from_store(subject_or_thumbprint, store_name="MY",
-                        store_location="LocalMachine"):
-    """Retrieve a public key from the Windows certificate store by subject CN or
-    thumbprint. WINDOWS ONLY -- uses the cryptography lib over the cert exported
-    from the store via PowerShell (no extra deps). Returns a public-key object or
-    None. INSPECTION-VERIFIED; must be tested on the target host."""
-    try:
-        # Export the matching cert as base64 DER via certutil/PowerShell.
-        ps = (
-            "$c = Get-ChildItem -Path Cert:\\%s\\%s | Where-Object "
-            "{ $_.Subject -like '*%s*' -or $_.Thumbprint -eq '%s' } | "
-            "Select-Object -First 1; "
-            "if ($c) { [Convert]::ToBase64String($c.RawData) }"
-            % (store_location, store_name,
-               subject_or_thumbprint, subject_or_thumbprint)
-        )
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                             capture_output=True, text=True, timeout=15)
-        b64 = out.stdout.strip()
-        if not b64:
-            return None
-        from cryptography import x509
-        cert = x509.load_der_x509_certificate(base64.b64decode(b64))
-        return cert.public_key()
-    except Exception:
-        return None
-
-
-def _today():
-    from datetime import date
-    return date.today().isoformat()
-
-
-def validate_rules(doc, is_forensic_file):
-    """Validate and normalize a ruleset's four lists in place. Returns
-    (clean_doc, problems) where problems is a list of (code, rule_id, message)
-    for the caller to emit as 907/908/etc. events.
-
-    Enforces: every rule has a non-empty `path` (else REJECTED, code 'no_path');
-    fills `reason`/`added_by`/`date` defaults; auto-numbers missing `rule_id`;
-    rejects duplicate rule_ids; rejects client rules using the reserved forensic
-    range (code 'reserved_range'); forensic file rules MUST be in the reserved
-    range."""
-    problems = []
-    seen_ids = set()
-    next_auto = {"I": 90001, "IC": 90001, "EC": 90001, "E": 90001}
-    prefix = {"includes": "I", "include_contains": "IC",
-              "exclude_contains": "EC", "excludes": "E"}
-
-    # Pre-scan all explicitly-assigned rule_ids so auto-numbering never collides.
-    explicit_ids = set()
-    for list_name in RULE_LISTS:
-        for rule in doc.get(list_name, []):
-            if isinstance(rule, dict):
-                rid = (rule.get("rule_id") or "").strip()
-                if rid:
-                    explicit_ids.add(rid)
-
-    def _next_free(pfx):
-        rid = "%s%d" % (pfx, next_auto[pfx])
-        while rid in explicit_ids or rid in seen_ids:
-            next_auto[pfx] += 1
-            rid = "%s%d" % (pfx, next_auto[pfx])
-        next_auto[pfx] += 1
-        return rid
-
-    for list_name in RULE_LISTS:
-        kept = []
-        for rule in doc.get(list_name, []):
-            if not isinstance(rule, dict):
-                problems.append(("malformed", None, "rule is not an object in %s" % list_name))
-                continue
-            path = (rule.get("path") or "").strip()
-            if not path:
-                problems.append(("no_path", rule.get("rule_id"),
-                                 "rule missing path in %s -- REJECTED" % list_name))
-                continue
-            rule["path"] = path
-
-            rid = (rule.get("rule_id") or "").strip()
-            if not rid:
-                rid = _next_free(prefix[list_name])
-                rule["rule_id"] = rid
-                problems.append(("auto_id", rid, "auto-numbered rule_id"))
-
-            if rid in seen_ids:
-                problems.append(("dup_id", rid, "duplicate rule_id -- REJECTED"))
-                continue
-            seen_ids.add(rid)
-
-            # Reserved forensic range enforcement.
-            in_reserved = _in_forensic_range(rid)
-            if is_forensic_file and not in_reserved:
-                problems.append(("forensic_range", rid,
-                                 "forensic rule outside I10001-10999"))
-            if (not is_forensic_file) and in_reserved:
-                problems.append(("reserved_range", rid,
-                                 "client rule uses reserved forensic range -- REJECTED"))
-                continue
-
-            for field, default in RULE_DEFAULTS.items():
-                if not (rule.get(field) or "").strip():
-                    rule[field] = default if default is not None else _today()
-            kept.append(rule)
-        doc[list_name] = kept
-    return doc, problems
-
-
-def _in_forensic_range(rule_id):
-    """True if a rule_id's numeric part is in the reserved forensic range."""
-    digits = "".join(ch for ch in rule_id if ch.isdigit())
-    if not digits:
-        return False
-    n = int(digits)
-    return FORENSIC_ID_MIN <= n <= FORENSIC_ID_MAX
-
-
-def detect_conflicts(merged):
-    """Find include/exclude contradictions in the MERGED ruleset for the startup /
-    reload validation pass. Returns a list of (include_rule_id, exclude_rule_id,
-    path) tuples. Because includes always win at runtime, these never fire as
-    runtime events -- they are surfaced once, up front, so the operator can fix the
-    config (or choose to continue). A conflict = a path that an include matches AND
-    an exclude also matches."""
-    m_inc = [(norm_path(r["path"]), r["rule_id"]) for r in merged.get("includes", [])]
-    m_inc_c = [(_frag(r["path"]), r["rule_id"]) for r in merged.get("include_contains", [])]
-    m_exc = [(norm_path(r["path"]), r["rule_id"]) for r in merged.get("excludes", [])]
-    m_exc_c = [(_frag(r["path"]), r["rule_id"]) for r in merged.get("exclude_contains", [])]
-
-    conflicts = []
-    # Exact include vs any exclude that would also catch that exact path.
-    for ip, iid in m_inc:
-        for ep, eid in m_exc:
-            if is_under(ip, ep):
-                conflicts.append((iid, eid, ip))
-        for ef, eid in m_exc_c:
-            if matches_contains(ip, ef):
-                conflicts.append((iid, eid, ip))
-    # Include-contains fragment vs exact exclude that sits inside it (best-effort:
-    # an exact exclude whose path contains the include fragment).
-    for ifr, iid in m_inc_c:
-        for ep, eid in m_exc:
-            if ifr in (ep + "\\"):
-                conflicts.append((iid, eid, ep))
-    return conflicts
-
-
-# =========================================================================== #
-#  5. ARCHIVE -- machine id, completeness, monthly bundle, EvtxECmd CSV
+#  3. ARCHIVE HELPERS -- machine id, EvtxECmd CSV wrapper
 # =========================================================================== #
 def compute_machine_id(machine_guid, instance_id=None):
     """Collector folder key. Cloud (instance_id present) => 'INSTANCEID-GUID'
@@ -640,20 +307,6 @@ def compute_machine_id(machine_guid, instance_id=None):
     if instance_id:
         return "%s-%s" % (instance_id, machine_guid)
     return machine_guid or "UNKNOWN"
-
-
-def check_archive_completeness(archive_dir, expected_count):
-    """Append-only-forever model: there must be at least *expected_count* monthly
-    archives (baseline + months_running). Returns (present, expected, missing).
-    A shortfall is the caller's 918 'baseline/archive missing' trigger -- because
-    nothing is ever culled, any gap is unambiguous."""
-    try:
-        present = len([f for f in os.listdir(archive_dir)
-                       if f.lower().endswith((".zip", ".7z"))])
-    except Exception:
-        present = 0
-    missing = max(0, expected_count - present)
-    return (present, expected_count, missing)
 
 
 def convert_evtx_to_csv(evtxecmd_path, evtx_path, out_dir, out_name):
@@ -668,55 +321,3 @@ def convert_evtx_to_csv(evtxecmd_path, evtx_path, out_dir, out_name):
         return csv_path if (res.returncode == 0 and os.path.exists(csv_path)) else None
     except Exception:
         return None
-
-
-def build_monthly_bundle(bundle_path, files):
-    """Compress *files* (evtx + CSV + baseline stats) into one archive. USN data
-    compresses ~50:1, so a month is tiny. Append-only: never deletes inputs here
-    (the caller decides when the live log is cleared). Returns the bundle path."""
-    import zipfile
-    with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        for f in files:
-            if f and os.path.exists(f):
-                z.write(f, arcname=os.path.basename(f))
-    return bundle_path
-
-
-# =========================================================================== #
-#  RULESET LOAD ORCHESTRATION (used by engine reload + the tools)
-# =========================================================================== #
-def load_signed_ruleset(path, public_key, is_forensic_file):
-    """Load, verify, and validate one signed ruleset file. Returns
-    (doc_or_None, problems). problems carries codes the caller maps to 9xx events:
-      'missing'   -> 910/911       'malformed'      -> 912
-      'bad_sig'   -> 909           plus per-rule codes from validate_rules.
-    On any hard failure doc is None and the caller keeps the last-good ruleset."""
-    problems = []
-    if not os.path.exists(path):
-        return None, [("missing", None, "ruleset file not found: %s" % path)]
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            doc = json.load(f)
-    except Exception as exc:
-        return None, [("malformed", None, "JSON parse failed: %r" % exc)]
-
-    if public_key is not None:
-        if not verify_signature(doc, public_key):
-            return None, [("bad_sig", None, "signature verification FAILED")]
-
-    doc, vproblems = validate_rules(doc, is_forensic_file)
-    problems.extend(vproblems)
-    return doc, problems
-
-
-def merge_rulesets(forensic_doc, client_doc):
-    """Merge forensic + client docs into one ruleset (the four lists concatenated).
-    Forensic rules first so they take precedence in any stable iteration. Returns
-    the merged dict; caller then builds a RuleMatcher and runs detect_conflicts."""
-    merged = {k: [] for k in RULE_LISTS}
-    for d in (forensic_doc, client_doc):
-        if not d:
-            continue
-        for k in RULE_LISTS:
-            merged[k].extend(d.get(k, []))
-    return merged
