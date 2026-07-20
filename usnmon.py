@@ -53,327 +53,13 @@ SERVICE_DISPLAY = "USN Journal Monitor (usnmon)"
 LOG_CHANNEL = "FileSystem"            # single log; everything goes here
 SOURCE_NAME = "USNJournalMonitor"
 
-DEFAULT_ARCHIVE_DIR = r"C:\FileSystem_Archives"
 DIAG_LOG_NAME = "usnmon.log"
 
-# Rotation
-ROTATE_BYTES = int(3.5 * 1024 * 1024 * 1024)   # 3.5 GB safety (evtx 4 GB hard cap)
+# Windows Event Log FileSystem channel size cap (4 GB), set by
+# register_event_source at install time. usnmon owns this channel and its
+# size setup; ongoing rotation/archival is handled by logmon.
 EVENTLOG_MAX_BYTES = 0xFFFFFFFF                  # 4 GB on channel creation
-SUBDAY_NAMING_THRESHOLD_SEC = 86400              # < 1 day -> timecode in archive name
 
-
-def _archive_format_date(dt, with_time):
-    """Format a datetime for use in an archive filename.
-
-    ISO-8601 style: YYYY-MM-DD, four-digit year, two-digit zero-padded month and day.
-    Alphabetical sort = chronological sort, which is exactly what an investigator
-    walking the FileSystem_Archives directory wants. When with_time=True, append
-    -HHMMSS (zero-padded 24-hour clock; hyphen separator chosen over ISO's 'T' for
-    filename readability)."""
-    if with_time:
-        return dt.strftime("%Y-%m-%d-%H%M%S")
-    return dt.strftime("%Y-%m-%d")
-
-
-def _is_midnight(dt):
-    """True iff this datetime is exactly midnight (00:00:00.000). Used by the naming
-    logic to decide whether a span needs a sub-day timecode."""
-    return (dt.hour == 0 and dt.minute == 0 and dt.second == 0
-            and dt.microsecond == 0)
-
-
-def _is_calendar_month_start(dt):
-    """True iff this datetime is the 1st of a calendar month at exactly midnight.
-    The 'is this a whole-calendar-month archive' check uses this for both ends."""
-    return _is_midnight(dt) and dt.day == 1
-
-
-def _next_rotation_boundary(anchor, rotate_period):
-    """Given a rotation anchor datetime and a rotate_period (n, unit) tuple, return the
-    datetime when the next rotation should fire.
-
-    Calendar units (d/w/M/y) snap to calendar boundaries past `anchor`:
-      - d: midnight at the start of (anchor.date + n days)
-      - w: 00:00 of the Monday at the start of (anchor's-iso-week + n weeks)
-      - M: 00:00 on the 1st of (anchor's month + n months)
-      - y: 00:00 on Jan 1 of (anchor's year + n years)
-    For calendar units the anchor's TIME component is ignored -- the rotation rule
-    defines the boundary on its own. anchor matters for "which calendar window?"
-
-    Interval units (s/m/h/t) are simply anchor + (n * unit-seconds)."""
-    if not rotate_period:
-        return None
-    n, unit = rotate_period
-    if unit not in _TIMEPERIOD_UNITS:
-        return None
-    secs, is_calendar = _TIMEPERIOD_UNITS[unit]
-    if not is_calendar:
-        from datetime import timedelta
-        return anchor + timedelta(seconds=n * secs)
-    # Calendar boundaries. The LOCKED RULE:
-    #   - If anchor is exactly ON a U-boundary at midnight, return anchor + n U-units
-    #     (clean cycle close: the rotation_anchor has been set by a previous archive
-    #     close to a boundary, and we now compute the next n-unit window's end).
-    #   - Otherwise, anchor is mid-window. Return the NEXT U-boundary, regardless of n
-    #     (ramp-in close: the first archive after a fresh start / mode change is the
-    #     partial leading unit only; clean n-cycles begin from there).
-    #
-    # The two-cases-per-unit design has a clean forensic signal: the first archive
-    # after fresh install is shorter than the configured cadence, and the investigator
-    # sees the cadence settle into clean n-unit chunks afterward.
-    if unit == "d":
-        from datetime import timedelta
-        day0 = datetime(anchor.year, anchor.month, anchor.day)   # midnight of anchor
-        if _is_midnight(anchor):
-            # On boundary: advance n days for the clean n-day window close.
-            return day0 + timedelta(days=n)
-        # Mid-window: ramp-in close at next midnight.
-        return day0 + timedelta(days=1)
-    if unit == "w":
-        from datetime import timedelta
-        days_until_monday = (7 - anchor.weekday()) % 7
-        if days_until_monday == 0 and _is_midnight(anchor):
-            # Anchor IS Monday-midnight (on boundary): advance n weeks.
-            return datetime(anchor.year, anchor.month, anchor.day) \
-                + timedelta(weeks=n)
-        # Mid-week (or Monday mid-day): ramp-in close at next Monday-midnight.
-        if days_until_monday == 0:
-            days_until_monday = 7      # Monday mid-day -> next Monday
-        return datetime(anchor.year, anchor.month, anchor.day) \
-            + timedelta(days=days_until_monday)
-    if unit == "M":
-        if _is_calendar_month_start(anchor):
-            # On boundary (1st 00:00): advance n calendar months.
-            return _add_calendar_months(anchor, n)
-        # Mid-month: ramp-in close at next 1st.
-        if anchor.month == 12:
-            return datetime(anchor.year + 1, 1, 1)
-        return datetime(anchor.year, anchor.month + 1, 1)
-    if unit == "y":
-        if (_is_midnight(anchor) and anchor.month == 1 and anchor.day == 1):
-            # On boundary (Jan 1 00:00): advance n calendar years.
-            return _add_calendar_months(anchor, n * 12)
-        # Mid-year: ramp-in close at next Jan 1.
-        return datetime(anchor.year + 1, 1, 1)
-    return None      # unreachable
-
-
-def _current_rotation_window_start(now, rotate_period):
-    """Given the current wall-clock time and a rotate_period, return the start of the
-    CALENDAR window the rule says we're currently inside.
-
-    For CALENDAR units, this is the rule-defined window boundary at or before `now`:
-      - 1d: today's midnight
-      - 1w: this week's Monday 00:00
-      - 1M: this month's 1st at 00:00
-      - 1y: this year's Jan 1 at 00:00
-      - 2d/2w/2M/2y: snap to N-aligned boundaries (a "1d" archive can be a 2d archive
-        with one of two parities; we choose the simplest -- snap to the calendar
-        boundary at-or-before `now` regardless of parity).
-
-    For INTERVAL units, there is no calendar-aligned window -- the window depends on
-    the engine's anchor (when it started). Returns None for interval units; the caller
-    must use rotation_anchor + engine_start_anchor logic instead."""
-    if not rotate_period:
-        return None
-    n, unit = rotate_period
-    if unit not in _TIMEPERIOD_UNITS:
-        return None
-    _secs, is_calendar = _TIMEPERIOD_UNITS[unit]
-    if not is_calendar:
-        return None        # interval modes have no calendar-aligned window
-    if unit == "d":
-        return datetime(now.year, now.month, now.day)
-    if unit == "w":
-        from datetime import timedelta
-        monday = now - timedelta(days=now.weekday())
-        return datetime(monday.year, monday.month, monday.day)
-    if unit == "M":
-        return datetime(now.year, now.month, 1)
-    if unit == "y":
-        return datetime(now.year, 1, 1)
-    return None
-
-
-def _archive_basename(archive_dir, rotate_period, start_dt=None, end_dt=None,
-                     reason=""):
-    """Pick the archive base name. v0.0.8 naming (was v0.0.7c-style; now driven by
-    rotate_period's unit instead of reason-string):
-
-      (a) Calendar-month rotation (rotate_period unit == 'M') AND the archive spans a
-          FULL calendar month (both endpoints at 1st-of-month midnight)
-          -> FileSystem_<MonthName>_<YYYY>  (e.g. 'June_2026'). Investigator reads it
-          straight: 'this is June 2026, intact.'
-
-      (b) EVERYTHING ELSE -> ISO-style span name:
-            FileSystem_YYYY-MM-DD_to_YYYY-MM-DD             (whole-day boundaries)
-            FileSystem_YYYY-MM-DD-HHMMSS_to_YYYY-MM-DD-HHMMSS  (sub-day boundary at
-                                                                either end)
-          The filename matches the rotation window. Critically, this includes the
-          case where 1M rotation was set but size cap fired mid-month: the moment a
-          calendar-month rotation uses span names, the investigator sees at a glance
-          'size cap hit this month' -- a forensic signal at the filename layer.
-
-    No _N counter. Spans self-disambiguate. Alphabetical sort = chronological.
-
-    rotate_period is (n, unit) or None. start_dt/end_dt are the rotation window's
-    bounds (from rotation_anchor and now)."""
-    end = end_dt or datetime.now()
-    start = start_dt or end
-    is_calendar_month_mode = (
-        rotate_period is not None
-        and rotate_period[1] == "M"
-        and rotate_period[0] == 1                          # 1M only -- 2M/3M never clean
-    )
-    is_full_calendar_month = (
-        is_calendar_month_mode
-        and _is_calendar_month_start(start)                # started exactly at 1st 00:00
-        and _is_calendar_month_start(end)                  # closing exactly at next 1st 00:00
-    )
-    if is_full_calendar_month:
-        return "FileSystem_%s_%d" % (start.strftime("%B"), start.year)
-    # Span naming: include timecode on each side INDEPENDENTLY. A midnight boundary
-    # gets just the date; a mid-day boundary gets -HHMMSS.
-    return "FileSystem_%s_to_%s" % (
-        _archive_format_date(start, not _is_midnight(start)),
-        _archive_format_date(end, not _is_midnight(end)),
-    )
-
-
-# --- legal retention -------------------------------------------------------- #
-# Retention units mix calendar-accurate and fixed-span on purpose. UNIT SEMANTICS
-# (document these for operators):
-#   y = calendar YEARS  (leap-aware; 5y = same month/day 5 years ago = 5*12 calendar
-#       months, NOT 5*365 fixed days)
-#   m = calendar MONTHS (month-length/leap aware; 18m = 18 calendar months ago)
-#   t = 30-day TERM units -- NOT calendar months. 18t = 18*30 = 540 fixed days.
-#   w = weeks (7 fixed days)
-#   d = calendar days (1 day each)
-# So 60t (1800 fixed days) and 5y (5 calendar years ~ 1826 days) are close but NOT
-# identical; pick the unit matching how the legal requirement is written ("retain 60
-# months as 30-day terms" -> 60t; "retain 5 years" -> 5y; "retain 25 years" -> 25y).
-# Integer values only (use 18M rather than 1.5y). Blank/None => keep EVERYTHING forever
-# (the default). Allowed units and caps: see RETENTION_CAPS below.
-
-
-def parse_retention(text):
-    """Parse a legal-retention term -> (n:int, unit:str) tuple, or None for blank/empty
-    (= keep everything) AND for any malformed input (fail-safe: an unparseable term must
-    NEVER trigger deletion). Thin wrapper over parse_timeperiod with RETENTION_CAPS.
-
-    Allowed units (d/w/t/M/y). NOTE: 'M' (capital) is calendar months as of v0.0.7d --
-    a v0.0.7c-and-earlier 'legal_retention: 18m' will now fail-safe to keep-everything,
-    which is the correct safe default for an unparseable config (deletion never
-    triggered without an explicit valid term)."""
-    return parse_timeperiod(text, RETENTION_CAPS)
-
-
-def parse_interval(text):
-    """Parse a rotation interval -> (n:int, unit:str) tuple, or None on bad/empty input.
-    Thin wrapper over parse_timeperiod with ROTATION_CAPS. Returns (n, unit) -- callers
-    use _period_advance() for calendar-aware boundary math (calendar units d/w/M/y) or
-    seconds-from-anchor math (interval units s/m/h/t).
-
-    v0.0.7d changes:
-      - Returns (n, unit) tuple instead of float-seconds. Callers must use
-        _period_advance() to compute boundary timestamps.
-      - 'd'/'w' now mean CALENDAR days/weeks (was fixed 86400s / 604800s).
-      - New units 'M' (calendar months) and 'y' (calendar years).
-      - Sub-day caps relaxed to 2-day max for s/m/h to support inter-day cadences."""
-    return parse_timeperiod(text, ROTATION_CAPS)
-
-
-def _sub_calendar_months(dt, months):
-    """Legacy thin wrapper -- new code should use _period_advance(dt, n, 'M', -1) or
-    _add_calendar_months(dt, -months) directly. Kept for any straggling caller."""
-    return _add_calendar_months(dt, -months)
-
-
-def _retention_horizon(now, term):
-    """Given (n, unit), return the cutoff datetime: archives whose ENTIRE month bucket
-    is older than this are eligible for pruning. Calendar-aware via _period_advance
-    (the same helper rotation uses) -- M/y advance by calendar months/years, d/w
-    by calendar days/weeks, t by fixed 30-day terms. Unified math, no special-cases."""
-    n, unit = term
-    return _period_advance(now, n, unit, direction=-1)
-
-
-def _bucket_end_date(year, month):
-    """The last moment of a calendar month = start of the next month. Used to test
-    whether an ENTIRE month bucket is older than the retention horizon (we only prune a
-    bucket when even its newest possible record has aged out)."""
-    if month == 12:
-        return datetime(year + 1, 1, 1)
-    return datetime(year, month + 1, 1)
-
-
-def prune_legal_retention(archive_dir, retention_term):
-    """Delete WHOLE month-bucket archives whose entire month has aged out beyond the
-    retention horizon. NEVER trims or reopens a sealed (hashed) archive -- only deletes
-    complete, fully-expired bundles, so every surviving archive's hash/manifest stays
-    intact. A bucket is eligible only when its END-OF-MONTH is older than the horizon,
-    guaranteeing we never delete a bucket still holding even one in-term day. No-op if
-    retention_term is None (keep everything). retention_term is a (n, unit) tuple from
-    parse_retention. Returns count of files deleted.
-
-    v0.0.7c: handles both naming styles.
-      - Calendar names (FileSystem_MonthName_YYYY[_legacyN]): the bucket end is the
-        last day of that month; delete iff that end is older than the horizon.
-      - Span names (FileSystem_YYYY-MM-DD..._to_YYYY-MM-DD...): the file's effective
-        end is the second date in the span; delete iff THAT end is older than the
-        horizon. This guarantees we never delete a span archive that still holds even
-        one in-term day -- the second date IS the last day of data, so if it's older
-        than the horizon, every record inside is too. Span-named files are NEVER
-        partially trimmed; same whole-file rule as calendar names."""
-    if not retention_term:
-        return 0
-    import re
-    month_num = {datetime(2000, m, 1).strftime("%B"): m for m in range(1, 13)}
-    horizon = _retention_horizon(datetime.now(), retention_term)
-    term_str = "%d%s" % retention_term
-    rx_cal = re.compile(r"FileSystem_([A-Za-z]+)_(\d{4})(?:_|\.)")
-    rx_span = re.compile(
-        r"FileSystem_(\d{4})-(\d{2})-(\d{2})(?:-\d{6})?"
-        r"_to_(\d{4})-(\d{2})-(\d{2})(?:-\d{6})?")
-    deleted = 0
-    try:
-        entries = os.listdir(archive_dir)
-    except Exception:
-        return 0
-    for f in entries:
-        if not f.lower().endswith((".zip", ".manifest", ".evtx")):
-            continue
-        effective_end = None
-        m = rx_cal.match(f)
-        if m and m.group(1) in month_num:
-            effective_end = _bucket_end_date(
-                int(m.group(2)), month_num[m.group(1)])
-        else:
-            m = rx_span.match(f)
-            if m:
-                # The second date in the span IS the last day of data. If THAT day
-                # is older than the horizon, every record inside is too -- safe to
-                # delete the whole file.
-                try:
-                    effective_end = datetime(
-                        int(m.group(4)), int(m.group(5)), int(m.group(6)),
-                        23, 59, 59)
-                except Exception:
-                    continue
-        if effective_end is None:
-            continue
-        if effective_end < horizon:
-            try:
-                os.remove(os.path.join(archive_dir, f))
-                deleted += 1
-                logger.info("legal-retention: pruned %s (aged out beyond %s)",
-                            f, term_str)
-            except Exception as exc:
-                logger.error("legal-retention: failed to prune %s: %r", f, exc)
-    if deleted:
-        emit_operational(904, "legal-retention pruned %d aged-out archive file(s) "
-                         "(term=%s)" % (deleted, term_str))
-    return deleted
 
 # Drive-monitor poll: every 6 seconds (10x/min).
 DRIVE_POLL_SEC = 6
@@ -396,13 +82,26 @@ logger = logging.getLogger("usnmon")
 # --------------------------------------------------------------------------- #
 # Logging / host context
 # --------------------------------------------------------------------------- #
-def setup_logging(to_console, archive_dir):
+# v0.0.9: diagnostic log lives at C:\ProgramData\usnmon\usnmon.log. Previously
+# it lived alongside the archive directory; archives moved to logmon so the
+# diagnostic log needed a new home. ProgramData matches the convention used by
+# every other piece of usnmon state (cursors, device_state.json, config).
+def _logs_dir():
+    base = os.environ.get("ProgramData", r"C:\ProgramData")
+    return os.path.join(base, "usnmon")
+
+
+def setup_logging(to_console, logs_dir=None):
+    """Configure the usnmon logger. v0.0.9: no archive_dir parameter -- the
+    diagnostic log lives at %ProgramData%\\usnmon\\usnmon.log by default."""
+    if logs_dir is None:
+        logs_dir = _logs_dir()
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     try:
-        os.makedirs(archive_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
         fh = logging.handlers.RotatingFileHandler(
-            os.path.join(archive_dir, DIAG_LOG_NAME),
+            os.path.join(logs_dir, DIAG_LOG_NAME),
             maxBytes=5 * 1024 * 1024, backupCount=3)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -738,9 +437,18 @@ class PathResolver:
 # --------------------------------------------------------------------------- #
 # Event emission  (single FileSystem channel)
 # --------------------------------------------------------------------------- #
-def register_event_source(archive_dir):
-    """Register the FileSystem channel + source and size it to 4 GB. Interactive
-    sizing prompt is intentionally omitted (kept simple; 4 GB on creation)."""
+def register_event_source():
+    """Register the FileSystem channel + source and size it to 4 GB.
+
+    v0.0.9 note (per extraction plan Q7.2): usnmon owns the FileSystem channel
+    setup because usnmon created the channel. The one-time `wevtutil sl` call
+    at install time is install-time configuration, NOT ongoing rotation
+    management -- ongoing rotation now lives in logmon. Sizing the channel
+    high (4 GB) at install matters because usnmon needs a large-enough
+    buffer to hold events between logmon archive cycles.
+
+    logmon, by contrast, never calls `wevtutil sl` because it operates on
+    OTHER services' channels; those setups are not logmon's concern."""
     try:
         win32evtlogutil.AddSourceToRegistry(SOURCE_NAME, msgDLL=None,
                                             eventLogType=LOG_CHANNEL)
@@ -775,16 +483,13 @@ def emit_event(event_id, values):
 # code -> (severity, message). Severity: "E"rror / "W"arning / "I"nfo.
 # Error-level also goes to the Windows Application log + a hidden error trail.
 OPERATIONAL = {
-    904: ("I", "Archive written"),
     914: ("I", "Engine started"),
     915: ("I", "Engine stopped"),
     916: ("W", "Drive/journal failure"),
     917: ("W", "Degraded state"),
-    918: ("E", "Archive completeness gap (expected month-bucket missing)"),
     919: ("W", "Volume present but has no active USN journal (not monitored)"),
     920: ("W", "Volume present but filesystem cannot host a USN journal (not monitored)"),
     921: ("W", "Volume present but is a remote/network share (no local journal; not monitored)"),
-    922: ("E", "Archive sign/hash failure"),
     923: ("W", "Journal resume gap (records lost while engine was stopped)"),
 }
 ERROR_TRAIL = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
@@ -828,13 +533,16 @@ def emit_operational(code, detail=""):
 # --------------------------------------------------------------------------- #
 # Per-drive capture loop
 # --------------------------------------------------------------------------- #
-def run_drive_engine(drive_root, should_stop, host_ctx_base, archive_dir):
+def run_drive_engine(drive_root, should_stop, host_ctx_base):
     """Open one volume, capture its USN journal start-to-real-time. First read
     starts at FirstUsn to grab the existing backlog (retroactive), then follows
     NextUsn. Emits every record to the FileSystem channel -- EXCEPT the engine's
-    own write paths (self-write-loop suppression), the one capture-time exception."""
+    own write paths (self-write-loop suppression), the one capture-time exception.
+
+    v0.0.9: signature no longer takes archive_dir (usnmon doesn't know about
+    archives; logmon owns them)."""
     device = drive_root_to_device(drive_root)
-    self_paths = _build_self_paths(archive_dir)
+    self_paths = _build_self_paths()
     try:
         h_vol = win32file.CreateFile(
             device, win32file.GENERIC_READ, FILE_SHARE_ALL, None,
@@ -955,19 +663,25 @@ def run_drive_engine(drive_root, should_stop, host_ctx_base, archive_dir):
             pass
 
 
-def _build_self_paths(archive_dir):
+def _build_self_paths():
     """Loop-prevention suppression -- NOT forensic filtering. We drop exactly the
     engine's own NOISE (writes that would feed back into the journal every cycle),
-    while KEEPING everything that is a real artifact: archives, manifests,
-    device_state.json, usnmon.log -- tampering with any of those is itself evidence.
+    while KEEPING everything that is a real artifact: device_state.json, usnmon.log,
+    logmon's archives -- tampering with any of those is itself evidence.
 
     Suppressed (deliberately minimal):
       * the LIVE FileSystem.evtx ONLY, at its real winevt\\Logs path -- so that when a
-        copy is exported to the archive dir, THAT write IS captured (moving evidence
+        copy is exported by logmon, THAT write IS captured (moving evidence
         out is exactly what we want recorded). A file merely *named* FileSystem.evtx
         anywhere else is NOT suppressed.
       * usnmon.cfg / usnmon.cfg.tmp anywhere (the 10-second cursor write + its atomic
         temp/rename churn) -- location is user-configurable, so match by name.
+
+    v0.0.9: signature no longer takes archive_dir -- usnmon doesn't know about
+    archive locations. logmon's archive writes appear in the journal and are
+    captured normally (which is correct: logmon moving evidence around IS
+    evidence).
+
     Returns a set of one full drive-relative path (the live log). Filenames are matched
     separately in _is_self_write."""
     sysroot = os.environ.get("SystemRoot", r"C:\Windows")
@@ -1065,8 +779,13 @@ def _save_device_state(state):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, sort_keys=True)
-        # Hash the state file too (an output that matters).
-        write_manifest(p, os.path.dirname(p))
+        # v0.0.9: previously called write_manifest(p, ...) to hash the state
+        # file (nice-to-have integrity check). That helper moved out with the
+        # rest of the archive/hashing infrastructure. State file remains
+        # unhashed; tampering with it changes device_state.json but does not
+        # affect capture (drives are always re-identified from the OS on
+        # attach), and any real-world tamper would show up as a modify event
+        # to the state file in the FileSystem channel itself.
     except Exception as exc:
         logger.error("device state save: %r", exc)
 
@@ -1202,176 +921,53 @@ def emit_device_removed(drive_root, host_ctx):
 # --------------------------------------------------------------------------- #
 # Orchestrator  (drive-monitor poll every 6s: add/remove drive threads)
 # --------------------------------------------------------------------------- #
-def _parse_anchor(s):
-    """Parse a 'YYYY-MM-DD HH:MM:SS' anchor string from config. Returns datetime or
-    None on miss/error (safe -- caller treats missing anchor as fresh-install case)."""
-    if not s:
-        return None
-    try:
-        return datetime.strptime(str(s), "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
+# v0.0.9: _parse_anchor removed. rotation_anchor no longer exists in the
+# config (logmon owns archive scheduling).
 
 
-def _run_restart_detection(archive_dir, host_ctx, now, rotate_period,
-                           persisted_anchor, rule_window_start, cfg):
-    """v0.0.8 restart detection. Decides which of four cases applies and acts:
+def _run_restart_detection():
+    """v0.0.9: engine-startup restart hook. Simplified to a no-op per the
+    v0.0.9 extraction plan section 5.4.
 
-      (1) FRESH INSTALL / no persisted anchor: initialize rotation_anchor to either
-          the rule-derived window start (calendar mode) or 'now' (interval mode).
-          No event emitted -- the 914 already documents the start.
+    In v0.0.8 this function reconciled the persisted rotation_anchor against
+    the current rotation window (four cases: fresh install, clock anomaly,
+    size-cap split, gap). All four cases were rotation-related; rotation now
+    lives in logmon. Cursor-restart detection is inherently PER-DRIVE and
+    already happens inside run_drive_engine() when it opens the journal and
+    checks the returned first-usn against the persisted cursor (emitting
+    923 'Resume gap' when the cursor's saved USN precedes the journal's first
+    valid USN).
 
-      (2) CLOCK ANOMALY (persisted_anchor > now): emit 926. Set rotation_anchor to
-          'now' since the persisted value is no longer trustworthy.
-
-      (3) SIZE-CAP SPLIT (persisted_anchor is INSIDE the current window): we're
-          continuing an in-progress window from where the previous size-cap closure
-          left off. Use persisted value as-is for the next archive.
-
-      (4) GAP (persisted_anchor is BEFORE the current window): at least one rotation
-          boundary was missed. For interval modes, also write a partial archive of
-          whatever was in the channel at engine_stop. Emit 925. Then reset
-          rotation_anchor to the new window start (rule-derived for calendar,
-          'now' for interval)."""
-    new_anchor = None
-    n_unit = rotate_period
-    is_calendar = bool(rule_window_start)
-
-    if persisted_anchor is None:
-        # Case 1: fresh install or first run.
-        new_anchor = rule_window_start or now
-        logger.info("rotation: fresh start anchor=%s", new_anchor.strftime(
-            "%Y-%m-%d %H:%M:%S"))
-    elif persisted_anchor > now:
-        # Case 2: clock anomaly. Emit 926 and reset anchor to now.
-        delta_sec = (persisted_anchor - now).total_seconds()
-        emit_operational(926, "Clock anomaly: persisted rotation_anchor %s is later "
-                         "than now %s by %.0fs. Setting rotation_anchor=now."
-                         % (persisted_anchor.strftime("%Y-%m-%d %H:%M:%S"),
-                            now.strftime("%Y-%m-%d %H:%M:%S"), delta_sec))
-        new_anchor = rule_window_start or now
-    elif is_calendar:
-        # Calendar mode: compare persisted_anchor to rule-derived window start.
-        if persisted_anchor >= rule_window_start:
-            # Case 3 (size-cap split): we're inside this window, persisted is the
-            # in-window restart point. Keep it -- the in-progress archive will be
-            # closed at the next rule boundary using this as its start.
-            new_anchor = persisted_anchor
-            logger.info("rotation: continuing in-progress window from %s",
-                        persisted_anchor.strftime("%Y-%m-%d %H:%M:%S"))
-        else:
-            # Case 4 (gap): at least one rotation boundary was missed. Emit 925.
-            # For calendar modes, no partial archive is needed -- the in-progress
-            # channel will close at the next boundary covering the visible
-            # 915/914 gap markers inside.
-            n, unit = n_unit
-            emit_operational(925, "Archiving gap detected: persisted "
-                             "rotation_anchor %s precedes current window start %s "
-                             "(missed >=1 %d%s rotation window). Resetting "
-                             "rotation_anchor to current window start."
-                             % (persisted_anchor.strftime("%Y-%m-%d %H:%M:%S"),
-                                rule_window_start.strftime("%Y-%m-%d %H:%M:%S"),
-                                n, unit))
-            new_anchor = rule_window_start
-    else:
-        # Interval mode. Compute what the NEXT boundary should have been from the
-        # persisted anchor; if it's in the past, we missed it.
-        next_boundary = _next_rotation_boundary(persisted_anchor, rotate_period)
-        if next_boundary and next_boundary > now:
-            # Case 3 (size-cap split or simply mid-window): continue normally.
-            new_anchor = persisted_anchor
-            logger.info("rotation: continuing interval window from %s "
-                        "(next close at %s)",
-                        persisted_anchor.strftime("%Y-%m-%d %H:%M:%S"),
-                        next_boundary.strftime("%Y-%m-%d %H:%M:%S"))
-        else:
-            # Case 4 (gap): we crossed at least one full interval boundary while down.
-            # For interval modes, ALSO write a partial archive of whatever was in the
-            # channel pre-stop (the records belong to the previous cycle which was
-            # supposed to close at next_boundary; we close it now with that named).
-            n, unit = n_unit
-            try:
-                archive_one(archive_dir, reason="restart-partial",
-                            rotate_period=rotate_period,
-                            forced_start=persisted_anchor, forced_end=now)
-                emit_operational(925, "Archiving gap detected (interval mode): "
-                                 "persisted rotation_anchor %s + interval %d%s "
-                                 "expired before restart at %s. Wrote partial "
-                                 "archive of in-channel records; new cycle "
-                                 "anchored at restart time."
-                                 % (persisted_anchor.strftime("%Y-%m-%d %H:%M:%S"),
-                                    n, unit,
-                                    now.strftime("%Y-%m-%d %H:%M:%S")))
-            except Exception as exc:
-                logger.error("restart-partial archive failed: %r", exc)
-                emit_operational(925, "Archiving gap detected (interval mode): "
-                                 "could not write partial archive: %r" % exc)
-            new_anchor = now
-    # Persist the resolved anchor.
-    cfg = read_config()
-    cfg["rotation_anchor"] = new_anchor.strftime("%Y-%m-%d %H:%M:%S")
-    _write_config_atomic(cfg)
+    This stub is retained so a future engine-level startup hook has a
+    documented insertion point. Callers pass no arguments; the function
+    returns None."""
+    return None
 
 
-def run_engine(should_stop, archive_dir, rotate_period=None):
-    """Main engine entry. v0.0.8 changes the signature: rotate_period is now a
-    (n, unit) tuple from parse_interval(), NOT a raw seconds count. The unit is used
-    to drive calendar-vs-interval boundary math via _period_advance() /
-    _next_rotation_boundary() / _current_rotation_window_start().
+def run_engine(should_stop):
+    """Main engine entry.
 
-    Startup performs RESTART DETECTION using three persisted state fields:
-      - install_month: when usnmon was first installed (already existed)
-      - engine_start_anchor: when THIS session started (every restart)
-      - rotation_anchor: the start of the current rotation window (set on every
-        successful archive close)
+    v0.0.9: rotation logic is gone. This is a pure recording engine:
+      1. Emit 914 Engine Started.
+      2. Enumerate drives; per-drive spawn a run_drive_engine() thread that
+         reads the USN journal into the FileSystem event channel.
+      3. Drive-monitor poll every DRIVE_POLL_SEC (6s) for attach/detach.
+      4. On stop, join drive threads, emit 915, exit.
 
-    Four restart cases are distinguished:
-      (1) Clean continuation: persisted rotation_anchor matches the rule-derived
-          current window start. Continue normally.
-      (2) Size-cap split: persisted rotation_anchor is AFTER the calendar-window start
-          (we're inside a window where a size-cap rotation already happened). Use the
-          persisted value as the start of the next archive.
-      (3) Gap (engine was down across >=1 rotation boundary): persisted rotation_anchor
-          is BEFORE the calendar-window start. Emit a NEW 925 "Archiving Gap
-          Detected" event documenting the missed window(s). For interval modes also
-          emit a partial closing archive named for (rotation_anchor -> engine_start).
-      (4) Clock anomaly: persisted rotation_anchor is in the FUTURE relative to now.
-          Emit a NEW 926 "Clock Anomaly Detected" event documenting the inconsistency
-          between persisted state and the system clock."""
+    Archive rotation, retention, hashing, and manifest work all live in the
+    companion logmon service. usnmon does not schedule any of that.
+    """
     host_ctx = gather_host_context()
     # Startup mode recorded at install (read back from Windows via QueryServiceConfig).
     startup = read_config().get("service_start_type", "unknown")
     emit_operational(914, "host=%s id=%s startup=%s"
                      % (host_ctx.get("Hostname"), host_ctx.get("MachineId"), startup))
 
-    # --- v0.0.8: rotation state machine -------------------------------------------
-    # Record engine_start_anchor for THIS session. Every restart updates this.
-    now = datetime.now()
-    cfg = read_config()
-    persisted_rot_anchor_str = cfg.get("rotation_anchor")
-    persisted_rot_anchor = _parse_anchor(persisted_rot_anchor_str)
-    cfg["engine_start_anchor"] = now.strftime("%Y-%m-%d %H:%M:%S")
-    _write_config_atomic(cfg)
-    # Compute the rule-derived window start. Calendar units have a deterministic value
-    # ("today's midnight", "this Monday", etc.); interval units don't (their window
-    # depends on the anchor, which is exactly what we're trying to validate).
-    rule_window_start = _current_rotation_window_start(now, rotate_period) \
-        if rotate_period else None
-    # Decide which case we're in and what to do about it.
-    _run_restart_detection(archive_dir, host_ctx, now, rotate_period,
-                           persisted_rot_anchor, rule_window_start, cfg)
-    # ---------------------------------------------------------------------- end ---
+    # v0.0.9: no rotation_anchor / engine_start_anchor / rotate_period tracking.
+    # Engine-startup restart hook is a documented no-op (see
+    # _run_restart_detection docstring).
+    _run_restart_detection()
 
-    # Legal-retention term from config. None/blank => keep everything forever.
-    retention_term = parse_retention(read_config().get("legal_retention"))
-    if retention_term:
-        logger.info("Legal retention: %d%s; aged-out month buckets are pruned at "
-                    "startup and on each month boundary.",
-                    retention_term[0], retention_term[1])
-        try:
-            prune_legal_retention(archive_dir, retention_term)   # prune at startup
-        except Exception as exc:
-            logger.error("legal-retention startup prune: %r", exc)
     threads = {}   # drive_root -> (thread, stop_event)
     # Volumes recorded once as present-but-unmonitorable, so they are NOT retried
     # every poll (no thrash). In-memory only -> a reboot re-classifies and re-emits,
@@ -1381,7 +977,7 @@ def run_engine(should_stop, archive_dir, rotate_period=None):
     def start_drive(root):
         ev = threading.Event()
         t = threading.Thread(target=run_drive_engine,
-                             args=(root, ev.is_set, host_ctx, archive_dir),
+                             args=(root, ev.is_set, host_ctx),
                              name="usn-%s" % root.rstrip("\\"), daemon=True)
         t.start()
         threads[root] = (t, ev)
@@ -1509,27 +1105,9 @@ def run_engine(should_stop, archive_dir, rotate_period=None):
         logger.info("%s present; classifying...", root)
         _dispatch_classify(root)
 
-    last_rotation_check = 0.0
     last_letters = enumerate_drive_letters()
-    # v0.0.8: compute when the NEXT rotation boundary is, from the current
-    # rotation_anchor + rotate_period. Recomputed on every successful archive close.
-    def _read_next_boundary():
-        anchor = _parse_anchor(read_config().get("rotation_anchor"))
-        if anchor is None or rotate_period is None:
-            return None
-        return _next_rotation_boundary(anchor, rotate_period)
-    next_boundary = _read_next_boundary()
-    if rotate_period:
-        n, unit = rotate_period
-        secs, is_calendar = _TIMEPERIOD_UNITS.get(unit, (0, False))
-        logger.info("Rotation: every %d%s (%s) OR %d-byte size cap, whichever first."
-                    "%s", n, unit, "calendar" if is_calendar else "interval",
-                    ROTATE_BYTES,
-                    "  next close: %s" % next_boundary.strftime("%Y-%m-%d %H:%M:%S")
-                    if next_boundary else "")
-    else:
-        logger.info("Rotation: NO period configured -- only size cap (%d bytes) "
-                    "will rotate.", ROTATE_BYTES)
+    logger.info("Recording to FileSystem channel. Archive management is handled "
+                "by logmon (if installed).")
     try:
         while not should_stop():
             # --- Drive monitor: CHEAP enumeration only (no device I/O). Attach/detach is
@@ -1571,33 +1149,8 @@ def run_engine(should_stop, archive_dir, rotate_period=None):
                     threads.pop(root, None)
                     drive_state.pop(root, None)
 
-            # --- Rotation triggers ---
-            # Size cap: always checked (catches a runaway between time boundaries).
-            if time.time() - last_rotation_check > 60:
-                try:
-                    maybe_rotate(archive_dir, rotate_period)
-                except Exception as exc:
-                    logger.error("rotation check: %r", exc)
-                last_rotation_check = time.time()
-                # If size-rotate fired, the rotation_anchor moved -> recompute the
-                # next boundary for the time-leg check below.
-                next_boundary = _read_next_boundary()
-
-            # Time leg: fire when we cross the next rule-derived boundary.
-            if next_boundary is not None and datetime.now() >= next_boundary:
-                try:
-                    archive_one(archive_dir, reason="time", rotate_period=rotate_period)
-                except Exception as exc:
-                    logger.error("time rotate: %r", exc)
-                # On a calendar-month boundary, also prune aged-out buckets.
-                if rotate_period and rotate_period[1] in ("M", "y"):
-                    if retention_term:
-                        try:
-                            prune_legal_retention(archive_dir, retention_term)
-                        except Exception as exc:
-                            logger.error("legal-retention prune: %r", exc)
-                # Recompute the next boundary from the new anchor.
-                next_boundary = _read_next_boundary()
+            # v0.0.9: no rotation triggers here. logmon owns rotation and
+            # retention on its own polling loop.
 
             # Sleep the poll interval in small slices so stop is responsive.
             for _ in range(DRIVE_POLL_SEC * 2):
@@ -1616,236 +1169,6 @@ def run_engine(should_stop, archive_dir, rotate_period=None):
 
 
 # --------------------------------------------------------------------------- #
-# Rotation / archive  (compress -> 4-hash -> sign -> sidecar manifest)
-# --------------------------------------------------------------------------- #
-def _channel_size_bytes():
-    try:
-        import subprocess
-        out = subprocess.run(["wevtutil", "gli", LOG_CHANNEL],
-                             capture_output=True, text=True, timeout=15).stdout
-        for line in out.splitlines():
-            if "fileSize" in line:
-                return int(line.split(":")[1].strip())
-    except Exception:
-        pass
-    return 0
-
-
-def maybe_rotate(archive_dir, rotate_period=None):
-    """Size-cap rotation: rotate when the live channel hits 3.5 GB, regardless of the
-    time leg (calendar or interval). v0.0.8: rotate_period is a (n, unit) tuple."""
-    if _channel_size_bytes() < ROTATE_BYTES:
-        return
-    archive_one(archive_dir, reason="size", rotate_period=rotate_period)
-
-
-def archive_one(archive_dir, reason="manual", rotate_period=None,
-                forced_start=None, forced_end=None):
-    """Export -> 4-hash+sign the EVTX -> write its .manifest -> zip the EVTX AND its
-    manifest together -> 904/922.
-
-    v0.0.8 naming: filename represents the ROTATION WINDOW (the span this archive was
-    *supposed* to cover), not the timestamps of first/last events in it. This is what
-    the rotation_anchor design buys us: the filename means 'this archive is the
-    rotation window from <start> to <end>; coverage gaps within (engine stopped, etc.)
-    are documented as 915/914 events INSIDE'.
-
-    Start time = rotation_anchor from config (or forced_start for restart-partial
-    archives). End time = now (or forced_end for forced bounds).
-
-    After successful close, rotation_anchor is updated to the next window's start (the
-    current end time, since the next archive's coverage begins where this one ends).
-
-    Order matters forensically: the hashes/signature must cover the EVIDENCE (the
-    .evtx), NOT the zip container. Hashes are taken at rest; evidence + proof are
-    bound inside one zip so they can never be separated."""
-    import subprocess
-    os.makedirs(archive_dir, exist_ok=True)
-
-    # Determine start/end of THIS archive's window.
-    now = datetime.now()
-    end_dt = forced_end or now
-    if forced_start is not None:
-        start_dt = forced_start
-    else:
-        cfg = read_config()
-        start_dt = _parse_anchor(cfg.get("rotation_anchor")) or end_dt
-
-    # Compute final basename FIRST -- no temp-name-then-rename dance anymore, because
-    # the filename comes from the rotation window, not the file's contents.
-    base = _archive_basename(archive_dir, rotate_period, start_dt, end_dt, reason)
-    month = end_dt.strftime("%Y-%m")
-    evtx = os.path.join(archive_dir, base + ".evtx")
-
-    # Collision protection: if a duplicate close happened in the same second (or a
-    # leftover from a crash), suffix with _dupN so forensic evidence is never lost.
-    if os.path.exists(evtx):
-        i = 2
-        while os.path.exists(os.path.join(archive_dir, "%s_dup%d.evtx" % (base, i))):
-            i += 1
-        evtx = os.path.join(archive_dir, "%s_dup%d.evtx" % (base, i))
-
-    try:
-        subprocess.run(["wevtutil", "epl", LOG_CHANNEL, evtx],
-                       capture_output=True, timeout=600, check=True)
-        subprocess.run(["wevtutil", "cl", LOG_CHANNEL],
-                       capture_output=True, timeout=60)
-    except Exception as exc:
-        emit_operational(916, "export/clear: %r" % exc)
-        return None
-
-    bundle_base = os.path.splitext(evtx)[0]
-    bundle = bundle_base + ".zip"
-    try:
-        manifest = write_manifest(evtx, archive_dir, month=month)
-        common.build_monthly_bundle(bundle, [evtx, manifest])
-        for loose in (evtx, manifest):
-            try:
-                os.remove(loose)
-            except Exception:
-                pass
-        emit_operational(904, "%s bundle=%s" % (reason, os.path.basename(bundle)))
-        # Persist the new rotation_anchor: this archive's end becomes the next
-        # archive's start. Skip for restart-partial closes (the caller has its own
-        # anchor logic).
-        if reason != "restart-partial":
-            try:
-                cfg = read_config()
-                cfg["rotation_anchor"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-                _write_config_atomic(cfg)
-            except Exception as exc:
-                logger.error("rotation_anchor persist: %r", exc)
-        return bundle
-    except Exception as exc:
-        emit_operational(922, "bundle/manifest: %r" % exc)
-        return None
-
-
-def _signing_key():
-    """Load the private signing key if configured (env var path to a PEM). Returns
-    None if unset -> manifest carries hashes only (still tamper-evident; not signed).
-    Production: ship/configure a key. Inspection-verified for the Windows path."""
-    pem = os.environ.get("USNMON_SIGNING_KEY", "").strip()
-    if not pem or not os.path.exists(pem):
-        return None
-    try:
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        with open(pem, "rb") as f:
-            return load_pem_private_key(f.read(), password=None)
-    except Exception:
-        return None
-
-
-def write_manifest(target_file, archive_dir, month=None):
-    """Sidecar manifest: four hashes (one read pass) + optional signature.
-    NEVER an ADS -- a sidecar survives FAT/exFAT/S3/Dropbox/email/zip transport.
-    Returns the manifest path."""
-    import hashlib
-    import json
-    h = {"md5": hashlib.md5(), "sha1": hashlib.sha1(),
-         "sha256": hashlib.sha256(), "sha512": hashlib.sha512()}
-    size = 0
-    with open(target_file, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            size += len(chunk)
-            for d in h.values():
-                d.update(chunk)   # one read, four digests in parallel
-    manifest = {
-        "file": os.path.basename(target_file),
-        "size": size,
-        "month": month or datetime.now().strftime("%Y-%m"),
-        "md5": h["md5"].hexdigest(),
-        "sha1": h["sha1"].hexdigest(),
-        "sha256": h["sha256"].hexdigest(),
-        "sha512": h["sha512"].hexdigest(),
-        "generated": now_utc_str(),
-        "generator": "usnmon %s" % common.SCHEMA_VERSION,
-        "note": "md5/sha1 legacy-interop only (collision-broken); sha256/sha512 authoritative",
-    }
-    key = _signing_key()
-    if key is not None:
-        try:
-            manifest["signature"] = common.sign_doc(manifest, key)
-        except Exception as exc:
-            logger.error("manifest sign: %r", exc)
-    mpath = target_file + ".manifest"
-    with open(mpath, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-    return mpath
-
-
-def check_completeness(archive_dir, install_month):
-    """Per-month-bucket FLOOR: every COMPLETED month from install->last-month must have
-    >=1 archive. Extras (multiple 3.5GB rotations in a month, or sub-day interval files)
-    are fine; a missing month-bucket is the 918 alarm. Returns list of missing 'YYYY-MM'.
-
-    The CURRENT (in-progress) month is excluded from the expectation: its archive isn't
-    written until the calendar-month rotation fires on the 1st of the following month, so
-    a quiet current month legitimately has no archive yet and must NOT be flagged. Only
-    a missing *completed* month is a real gap. (A current month that DID hit the 3.5GB
-    size cap will have an archive, which is fine -- we just don't *require* one.)
-
-    Recognizes BOTH naming styles (v0.0.7c changed the scheme):
-      - Calendar names: FileSystem_<MonthName>_<Year>[_optional_legacy_N]  -- the new
-        clean form 'FileSystem_June_2026' AND the legacy v0.0.7 form
-        'FileSystem_June_2026_3' both count as covering June 2026.
-      - Span names: FileSystem_YYYY-MM-DD[-HHMMSS]_to_YYYY-MM-DD[-HHMMSS] -- a span is
-        considered to COVER every calendar month its date range touches (inclusive of
-        partial months at either end), so a 30-day term spanning June 17 -> July 16
-        covers both June 2026 and July 2026. This is what completeness really means:
-        was data captured for that month, not 'is the name labeled with that month.'"""
-    import re
-    month_num = {datetime(2000, m, 1).strftime("%B"): m for m in range(1, 13)}
-    have = set()
-    # Calendar-name pattern: FileSystem_<MonthName>_<4digit year>[_<rest>]?
-    rx_cal = re.compile(r"FileSystem_([A-Za-z]+)_(\d{4})(?:_|\.)")
-    # Span-name pattern: FileSystem_YYYY-MM-DD[-HHMMSS]_to_YYYY-MM-DD[-HHMMSS]
-    rx_span = re.compile(
-        r"FileSystem_(\d{4})-(\d{2})-(\d{2})(?:-\d{6})?"
-        r"_to_(\d{4})-(\d{2})-(\d{2})(?:-\d{6})?")
-    try:
-        for f in os.listdir(archive_dir):
-            if not f.lower().endswith((".zip", ".manifest")):
-                continue
-            m = rx_cal.match(f)
-            if m and m.group(1) in month_num:
-                have.add("%04d-%02d" % (int(m.group(2)), month_num[m.group(1)]))
-                continue
-            m = rx_span.match(f)
-            if m:
-                sy, sm = int(m.group(1)), int(m.group(2))
-                ey, em = int(m.group(4)), int(m.group(5))
-                # Walk every (year, month) tuple from start through end inclusive.
-                y, mo = sy, sm
-                while (y, mo) <= (ey, em):
-                    have.add("%04d-%02d" % (y, mo))
-                    mo += 1
-                    if mo > 12:
-                        mo = 1; y += 1
-    except Exception:
-        return []
-    # Expected buckets: install_month .. the LAST COMPLETED month (i.e. the month
-    # BEFORE the current one). The current in-progress month is not yet required.
-    iy, im = map(int, install_month.split("-"))
-    now = datetime.now()
-    # Last completed month = current month minus one.
-    if now.month == 1:
-        ey, em = now.year - 1, 12
-    else:
-        ey, em = now.year, now.month - 1
-    missing = []
-    y, mo = iy, im
-    while (y, mo) <= (ey, em):
-        bucket = "%04d-%02d" % (y, mo)
-        if bucket not in have:
-            missing.append(bucket)
-        mo += 1
-        if mo > 12:
-            mo = 1; y += 1
-    return missing
-
-
-# --------------------------------------------------------------------------- #
 # Windows service wrapper
 # --------------------------------------------------------------------------- #
 if _WINDOWS and win32serviceutil is not None:
@@ -1856,7 +1179,7 @@ if _WINDOWS and win32serviceutil is not None:
         def __init__(self, args):
             win32serviceutil.ServiceFramework.__init__(self, args)
             self.h_stop = win32event.CreateEvent(None, 0, 0, None)
-            self._archive_dir = read_archive_dir()
+            # v0.0.9: no self._archive_dir -- usnmon doesn't manage archives.
 
         def SvcStop(self):
             self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
@@ -1867,10 +1190,9 @@ if _WINDOWS and win32serviceutil is not None:
                 win32event.WAIT_OBJECT_0
 
         def SvcDoRun(self):
-            setup_logging(False, self._archive_dir)
-            register_event_source(self._archive_dir)
-            rotate_period = parse_interval(read_config().get("rotate_interval", ""))
-            run_engine(self.should_stop, self._archive_dir, rotate_period)
+            setup_logging(False)             # writes to C:\ProgramData\usnmon\
+            register_event_source()          # one-time channel setup
+            run_engine(self.should_stop)     # no rotate_period, no archive_dir
 
 
     def query_service_start_type():
@@ -1909,7 +1231,7 @@ if _WINDOWS and win32serviceutil is not None:
 
 
 # --------------------------------------------------------------------------- #
-# Config (minimal: just archive_dir + install month -- NO signed ruleset)
+# Config (minimal: service start type + runtime cursors -- NO archive knobs)
 # --------------------------------------------------------------------------- #
 def _config_path():
     base = os.environ.get("ProgramData", r"C:\ProgramData")
@@ -1936,22 +1258,16 @@ def _write_config_atomic(cfg):
     Key ordering on disk is enforced -- not left to dict insertion order -- so a user
     inspecting the file always sees:
       1. _README warning FIRST (the gatekeeper -- read this before touching anything),
-      2. settings keys (the things you might want to change with `usnmon config`),
-      3. cursors LAST (the runtime state the README is warning you not to edit).
-    This applies on every write, so a v0.0.7 file with cursors-first will be re-ordered
-    on its next save (typically the next cursor flush, ~10s after the upgraded engine
-    starts)."""
+      2. settings keys (just service_start_type in v0.0.9),
+      3. cursors LAST (the runtime state the README is warning you not to edit)."""
     import json
     cfg = dict(cfg)
     readme = ("DO NOT EDIT BY HAND. This file holds live runtime state "
               "(USN cursors) updated every ~10s; hand-editing can corrupt it "
               "and break gap-free capture. Change settings with: usnmon config")
-    # Stable settings order. Anything not listed here gets appended alphabetically
-    # between settings and cursors (forward-compatible: an unknown key from a newer
-    # version still round-trips, just at a deterministic spot).
-    SETTINGS_ORDER = ("archive_dir", "rotate_interval", "legal_retention",
-                      "service_start_type", "install_month",
-                      "engine_start_anchor", "rotation_anchor")
+    # v0.0.9: only settings key is service_start_type. Any unknown key
+    # round-trips at a deterministic spot between settings and cursors.
+    SETTINGS_ORDER = ("service_start_type",)
     ordered = {}
     ordered["_README"] = readme
     for k in SETTINGS_ORDER:
@@ -1980,25 +1296,15 @@ def _write_config_atomic(cfg):
             pass
 
 
-def read_archive_dir():
-    """Return the configured archive directory, VALIDATED. If the stored value is
-    missing or fails sanitization (e.g. it was tampered with forbidden characters or a
-    traversal), fall back to the safe default rather than letting a malformed path reach
-    filesystem operations. All config values are data; this one touches the FS, so it is
-    validated on every read."""
-    raw = read_config().get("archive_dir", DEFAULT_ARCHIVE_DIR)
-    ok, result = _v_archive_dir(str(raw))
-    if not ok:
-        logger.warning("configured archive_dir %r invalid (%s); using default %s",
-                       raw, result, DEFAULT_ARCHIVE_DIR)
-        return DEFAULT_ARCHIVE_DIR
-    return result
+# v0.0.9: read_archive_dir() removed. usnmon no longer knows about archive
+# directories; logmon owns archives.
 
 
-def write_config(archive_dir):
+def write_config():
+    """Initialize the config file (create parent dir, write _README + placeholder).
+    v0.0.9: no archive_dir argument. Called at install time so the file exists
+    before the service starts."""
     cfg = read_config()
-    cfg["archive_dir"] = archive_dir
-    cfg.setdefault("install_month", datetime.now().strftime("%Y-%m"))
     _write_config_atomic(cfg)
 
 
@@ -2034,208 +1340,26 @@ def save_cursor(drive_root, journal_id, last_usn):
         _write_config_atomic(cfg)
 
 
-# --- time-period parsing (unified for rotation AND retention) -------------- #
-#
-# Every '<n><unit>' time-period in usnmon -- rotation cadence AND retention horizon --
-# is parsed by the SAME function and obeys the SAME unit table. This is what makes
-# `--log-interval 1M` (rotate every calendar month) and `--legal-retention 25y` (keep
-# 25 calendar years of evidence) syntactically consistent rather than two parallel
-# vocabularies.
-#
-# Each unit is either CALENDAR (boundaries are date-arithmetic: next midnight, next
-# Monday 00:00, next 1st-of-month, etc., leap- and month-length-aware) or INTERVAL
-# (boundaries are a fixed seconds count from a reference point). The unit's nature is
-# captured per-unit in _TIMEPERIOD_UNITS and dispatches automatically via
-# _period_advance(). Substitution gives flexibility without ambiguity:
-#   "every calendar week"           -> 1w
-#   "every 7 days from start"       -> 7d   (still calendar -- start aligns to midnight)
-#   "every 7*24 = 168 hours from start" -> 168h (interval -- arbitrary anchor)
-#   "every calendar month"          -> 1M
-#   "every 30 days from start"      -> 1t   (interval -- 30-day fixed term)
-#
-# CRITICAL: 'm' is MINUTES (interval), 'M' (uppercase) is calendar MONTHS. This is
-# the ONE case-sensitive distinction in the whole scheme; everything else is lower-case.
-# A v0.0.7c-and-earlier config using 'm' for legal-retention months MUST be migrated
-# to 'M'; the new parser rejects 'm' on retention configs (sub-day intervals make no
-# sense for retention) -- bad input fails safe (= keep everything).
-
-_TIMEPERIOD_UNITS = {
-    # unit: (seconds-per, calendar?)  -- seconds-per is for interval units; calendar
-    # units carry it for fixed-interval estimation only (rotation-window math uses
-    # date arithmetic, NOT this number).
-    "s": (1,        False),
-    "m": (60,       False),
-    "h": (3600,     False),
-    "d": (86400,    True),       # calendar day: next-midnight boundaries
-    "w": (604800,   True),       # calendar week: next-Monday-00:00 boundaries (ISO 8601)
-    "t": (2592000,  False),      # 30-day "term": fixed 30*24*3600s interval
-    "M": (2629800,  True),       # calendar month (avg secs for estimation; real math
-                                 # uses _sub_calendar_months / _add_calendar_months)
-    "y": (31557600, True),       # calendar year (avg secs; real math via date arith)
-}
-
-# Per-use-case caps: each unit has a max-N appropriate to that use case. Caller passes
-# the table to parse_timeperiod; missing entries mean "this unit not allowed here."
-ROTATION_CAPS = {
-    "s": 172800,    # 2 days in seconds
-    "m": 2880,      # 2 days in minutes
-    "h": 336,       # 2 weeks in hours (allows weird inter-day cadences like 36h)
-    "d": 180,       # ~6 months in calendar days
-    "w": 52,        # 1 year in weeks
-    "t": 12,        # 1 year in 30-day terms
-    "M": 12,        # 1 calendar year in months
-    "y": 1,         # 1 calendar year (rotation longer than a year weakens integrity)
-}
-RETENTION_CAPS = {
-    # Sub-day units (s/m/h) intentionally OMITTED -- retention shorter than a day is
-    # nonsensical (you'd be pruning archives that haven't even been written).
-    "d": 3650,      # 10 years in days
-    "w": 520,       # 10 years in weeks
-    "t": 120,       # 10 years in 30-day terms
-    # M/y push to 25y: real-world drivers like pediatric medical-records retention
-    # (age of majority + 3y = 21y in many US states; EMR systems must demonstrate
-    # the underlying SQL database file's life across that window).
-    "M": 300,       # 25 years in calendar months
-    "y": 25,        # 25 calendar years
-}
-
-
-def parse_timeperiod(text, caps):
-    """Parse '<N><unit>' (e.g. '6M', '90d', '1y', '24h') into a (n:int, unit:str) tuple
-    appropriate for the supplied caps table. Returns None for blank input (= caller's
-    'unset' semantics: keep-everything for retention, no-override for rotation) AND for
-    ANY malformed input (fail-safe: an unparseable spec must NEVER produce a usable
-    value, so an attacker-controlled config can't smuggle through a hostile cadence).
-
-    Integer magnitudes only -- fractional periods like '0.5y' are rejected; use a finer
-    unit ('6M', '180d', etc.). Case is significant on 'm' vs 'M' (the only such pair in
-    the scheme): 'm' = minutes, 'M' = calendar months. All other letters are lower-case.
-
-    `caps` is one of ROTATION_CAPS or RETENTION_CAPS (or any compatible {unit: max_n}
-    dict). A unit not in `caps` is rejected (e.g. '6h' for retention -> None). A
-    magnitude > caps[unit] is rejected (e.g. '50y' for rotation -> None)."""
-    if not text or not str(text).strip():
-        return None
-    import re as _re
-    # Strict: digits-only magnitude, single-letter unit, case-significant.
-    mo = _re.fullmatch(r"\s*([0-9]{1,5})\s*([smhdwtMy])\s*", str(text))
-    if not mo:
-        return None
-    n = int(mo.group(1))
-    unit = mo.group(2)
-    if unit not in caps:
-        return None              # disallowed for this use case
-    if n < 1 or n > caps[unit]:
-        return None              # out-of-range magnitude
-    return (n, unit)
-
-
-def _add_calendar_months(dt, months):
-    """Add N calendar months to dt; clamps the day to the target month's last valid day
-    (so e.g. Jan 31 + 1 month -> Feb 28/29). Leap- and month-length-aware. Mirror of
-    _sub_calendar_months which already existed for retention horizon math."""
-    import calendar
-    total = (dt.year * 12 + (dt.month - 1)) + months
-    y, m = divmod(total, 12)
-    m += 1
-    day = min(dt.day, calendar.monthrange(y, m)[1])
-    return dt.replace(year=y, month=m, day=day)
-
-
-def _period_advance(dt, n, unit, direction=1):
-    """Move `dt` forward (+1) or backward (-1) by N units, using CALENDAR-AWARE math
-    for calendar units (d/w/M/y) and FIXED-INTERVAL math for interval units (s/m/h/t).
-    This is the one helper rotation and retention both use to translate a time-period
-    into an actual datetime boundary."""
-    if unit not in _TIMEPERIOD_UNITS:
-        return dt        # safe pass-through; parse_timeperiod prevents reaching here
-    secs, is_calendar = _TIMEPERIOD_UNITS[unit]
-    if is_calendar:
-        # Calendar-aware arithmetic per unit.
-        from datetime import timedelta as _td
-        if unit == "d":
-            return dt + _td(days=direction * n)
-        if unit == "w":
-            return dt + _td(weeks=direction * n)
-        if unit == "M":
-            return _add_calendar_months(dt, direction * n)
-        if unit == "y":
-            # Calendar years preserve month/day; clamp Feb 29 -> Feb 28 in non-leap.
-            return _add_calendar_months(dt, direction * n * 12)
-    # Interval units: fixed seconds from dt.
-    from datetime import timedelta as _td
-    return dt + _td(seconds=direction * n * secs)
-
 
 # --- config editor (`usnmon config`) ---------------------------------------- #
-# User-editable settings ONLY. Runtime/derived keys (cursors, install_month, _README)
-# are deliberately NOT exposed -- the user cannot see or edit the cursor block, so they
-# can never corrupt capture continuity through this tool. Each entry: (config-key,
-# label, validator). Validator returns (ok, normalized_value_or_msg).
+# v0.0.9: no user-editable settings. The subcommand is retained for backward
+# compatibility -- it prints an informational message pointing at logmon and
+# at pywin32's --startup for the service start type.
 #
-# SECURITY: input SANITIZATION, not code detection. Every value is treated as DATA and
-# is never executed/eval'd anywhere. Validators strip characters invalid for the input
-# type and REJECT malformed values rather than coercing them. This is defense in depth
-# for the config-edit surface; it is not a claim to detect "injected code" (which is
-# undecidable) -- it is strict, bounded input validation.
+# In v0.0.8 this file carried a validator table for archive_dir, rotate_interval,
+# and legal_retention. Those keys were removed when archive management moved to
+# logmon. The docstring/comment retention here is intentional so a future reader
+# understands why the editor is a stub rather than a live tool.
 
-# Characters never legitimate in a Windows path value (shell/redirection/quote/control
-# metacharacters and the reserved < > | " * ? chars). Stripped on input.
-_PATH_FORBIDDEN = set('<>"|*?;&`$\n\r\t\x00') | {chr(c) for c in range(32)}
-
-def _v_archive_dir(s):
-    # Benign normalization only: trim whitespace and a single layer of surrounding
-    # quotes. Forbidden characters cause REJECTION (not silent stripping) -- silently
-    # cleaning 'C:\evil|<>bad' into 'C:\evilbad' would accept a path the user never
-    # typed; for the engine read path there's no human to confirm the cleaned result.
-    s = s.strip().strip('"').strip("'").strip()
-    if not s:
-        return False, "path cannot be empty"
-    bad = sorted(_PATH_FORBIDDEN & set(s))
-    if bad:
-        shown = "".join(c for c in bad if c.isprintable()) or "control chars"
-        return False, "path contains forbidden character(s): %s" % shown
-    import re as _re
-    if not _re.match(r"^([A-Za-z]:\\|\\\\)", s):
-        return False, "use an absolute path, e.g. C:\\FileSystem_Archives"
-    if ".." in s.replace("\\", "/").split("/"):
-        return False, "path must not contain '..' (traversal)"
-    if len(s) > 248:
-        return False, "path too long (max 248 chars)"
-    return True, s
-
-def _v_interval(s):
-    s = s.strip()
-    if not s:
-        return True, ""        # cleared -> calendar-month rotation by default
-    # Reject anything outside the expected alphabet rather than silently stripping it.
-    # parse_interval is the strict gate; this regex is a fast pre-check that lets us
-    # give a unit-list error message. Case-significant: m=minutes, M=calendar months.
-    import re as _re
-    if not _re.fullmatch(r"[0-9]+[smhdwtMy]", s):
-        return False, ("use e.g. 10m, 6h, 1d, 2w, 1t, 1M, 1y "
-                       "(m=minutes, M=calendar months); empty = default")
-    return (True, s) if parse_interval(s) is not None else \
-        (False, "magnitude out of range; check ROTATION_CAPS for the per-unit max")
-
-def _v_retention(s):
-    s = s.strip().strip('"').strip("'")
-    if not s:
-        return True, ""        # cleared -> keep everything
-    # Reject (don't strip) -- '65.4y' must NOT become '654y'. Integer + unit only.
-    # v0.0.8: 'M' = calendar months; 'm' (minutes) is NOT valid for retention.
-    import re as _re
-    if not _re.fullmatch(r"[0-9]+[dwtMy]", s):
-        return False, ("use e.g. 25y, 18M, 90d, 18t, 26w, or empty to keep "
-                       "everything (M = calendar months; m = minutes, not valid here)")
-    return (True, s) if parse_retention(s) is not None else \
-        (False, "bad term (or out of range); use e.g. 25y, 18M, 90d, 18t, 26w")
+# v0.0.9: _PATH_FORBIDDEN and _v_archive_dir removed with the archive_dir
+# config key. logmon owns archive-path validation for its own config.
 
 
 _CONFIG_EDITABLE = [
-    ("archive_dir",        "Archive directory",      _v_archive_dir),
-    ("rotate_interval",    "Rotation interval",      _v_interval),
-    ("legal_retention",    "Legal retention term",   _v_retention),
+    # v0.0.9: no user-editable settings via `usnmon config`. archive_dir /
+    # rotate_interval / legal_retention were removed in the v0.0.9 archive-
+    # management extraction. service_start_type is owned by Windows (set via
+    # pywin32's --startup at install; read back via QueryServiceConfig).
 ]
 # NOTE: service_start_type is intentionally NOT editable here. With Option A the start
 # mode is owned by Windows -- set at install via pywin32's native --startup flag and
@@ -2244,10 +1368,9 @@ _CONFIG_EDITABLE = [
 # the actual service, so it is excluded.
 
 # The complete set of keys usnmon itself writes. Anything else in the cfg is unexpected
-# (stray/injected) and is reported by the integrity check.
+# (stray/injected) and is reported by the integrity check as an unknown key.
 _CONFIG_KNOWN_KEYS = {
-    "archive_dir", "rotate_interval", "legal_retention", "service_start_type",
-    "install_month", "engine_start_anchor", "rotation_anchor", "cursors", "_README",
+    "service_start_type", "cursors", "_README",
 }
 
 
@@ -2255,15 +1378,17 @@ def validate_config_integrity(cfg):
     """SANITIZATION-oriented integrity check on a loaded config dict. Returns a list of
     human-readable problem strings (empty = clean). Does NOT mutate the file; it REPORTS
     anomalies so an operator can see if the cfg was modified outside the expected schema.
-    Checks: unknown top-level keys, malformed editable values, and a malformed cursors
-    block. (We validate as DATA -- nothing here executes any config content.)"""
+    Checks: unknown top-level keys and a malformed cursors block. (We validate as DATA
+    -- nothing here executes any config content.)"""
     problems = []
     if not isinstance(cfg, dict):
         return ["config is not a JSON object"]
     for k in cfg:
         if k not in _CONFIG_KNOWN_KEYS:
             problems.append("unknown key %r (not written by usnmon)" % k)
-    # Editable values must pass their validators.
+    # v0.0.9: _CONFIG_EDITABLE is empty, so the editable-value loop is a no-op.
+    # Retained as a stub so future additions to _CONFIG_EDITABLE plug in without
+    # extra scaffolding.
     for key, label, validator in _CONFIG_EDITABLE:
         if key in cfg:
             ok, _res = validator(str(cfg.get(key, "")))
@@ -2298,210 +1423,165 @@ def _service_is_running():
 
 
 def run_config_editor():
-    """Interactive, numbered console editor for the user-changeable settings. The
-    monitor MUST be stopped while editing (it writes the cursor block every ~10s; a
-    concurrent settings write would race it). Detects a running service and offers to
-    stop it. Only whitelisted settings are shown; the cursor block is preserved
-    untouched on write. Runs an input-integrity check on entry and reports any anomaly
-    (unknown keys / malformed values) so config tampering is visible."""
+    """v0.0.9: informational stub. usnmon no longer has user-editable settings.
+    Prints where the config lives, notes the read-only start type, and directs
+    the operator to logmon for archive configuration."""
     print("usnmon configuration\n" + "-" * 40)
+    cfg = read_config()
 
-    # Integrity check (sanitization-oriented): report -- don't auto-mutate.
-    pre = read_config()
-    issues = validate_config_integrity(pre)
+    issues = validate_config_integrity(cfg)
     if issues:
-        print("NOTICE: config integrity check found %d anomaly(ies):" % len(issues))
+        print("NOTICE: config integrity check found %d anomaly(ies):"
+              % len(issues))
         for it in issues:
             print("   - %s" % it)
-        print("   (Unknown keys are ignored by the engine; malformed editable values\n"
-              "    can be corrected below. The cursor block is never auto-changed.)\n")
+        print()
 
-    if _service_is_running():
-        print("The %s service is RUNNING. It must be stopped to edit the config\n"
-              "safely (the engine writes cursor state continuously)." % SERVICE_NAME)
-        ans = input("Stop the service now and edit? [y/N]: ").strip().lower()
-        if ans != "y":
-            print("Left running. No changes made.")
-            return
-        try:
-            win32serviceutil.StopService(SERVICE_NAME)
-            import time as _t
-            for _ in range(20):
-                if not _service_is_running():
-                    break
-                _t.sleep(0.5)
-            print("Service stopped.")
-        except Exception as exc:
-            print("Could not stop service (%r). Aborting; no changes made." % exc)
-            return
-        restart_after = True
-    else:
-        restart_after = False
-
-    cfg = read_config()
-    while True:
-        print("\nCurrent settings:")
-        for n, (key, label, _v) in enumerate(_CONFIG_EDITABLE, 1):
-            val = cfg.get(key, "")
-            shown = val if val != "" else "(default)"
-            print("  %d. %-22s %s" % (n, label + ":", shown))
-        # Read-only: start type is owned by Windows (set at install via --startup).
-        print("     %-22s %s  (read-only; set with --startup at install)"
-              % ("Service start type:", cfg.get("service_start_type", "unknown")))
-        print("  0. Save and exit")
-        choice = input("\nEdit which # (0 to save): ").strip()
-        if choice == "0":
-            break
-        if not choice.isdigit() or not (1 <= int(choice) <= len(_CONFIG_EDITABLE)):
-            print("  -> enter a number 0-%d." % len(_CONFIG_EDITABLE))
-            continue
-        key, label, validator = _CONFIG_EDITABLE[int(choice) - 1]
-        cur = cfg.get(key, "")
-        print("  %s -- current: %s" % (label, cur if cur != "" else "(default)"))
-        newval = input("  new value (blank to clear/default): ")
-        ok, result = validator(newval)
-        if not ok:
-            print("  -> rejected: %s" % result)
-            continue
-        cfg[key] = result
-        print("  -> set %s = %s" % (label, result if result != "" else "(default)"))
-
-    # Preserve cursors + every non-editable key: we started from the full read_config()
-    # dict and only touched whitelisted keys, so the cursor block is written back intact.
-    _write_config_atomic(cfg)
-    print("\nSaved to %s" % _config_path())
-
-    if restart_after:
-        ans = input("Restart the service now? [Y/n]: ").strip().lower()
-        if ans in ("", "y"):
-            try:
-                win32serviceutil.StartService(SERVICE_NAME)
-                print("Service restarted; new settings loaded.")
-            except Exception as exc:
-                print("Could not restart (%r). Start it manually: usnmon start" % exc)
-        else:
-            print("Service left stopped. Start it with: usnmon start")
+    print("Config file:       %s" % _config_path())
+    print("Diagnostic log:    %s"
+          % os.path.join(_logs_dir(), DIAG_LOG_NAME))
+    print("Service start type: %s  (read-only; set with --startup at install)"
+          % cfg.get("service_start_type", "unknown"))
+    print()
+    print("v0.0.9: usnmon has no user-editable settings. Archive management "
+          "(rotation, hashing, retention, legal-hold) now lives in the "
+          "companion logmon service. Configure archives there.")
+    print()
+    print("To change the service start type: reinstall with pywin32's "
+          "--startup flag, e.g.:")
+    print("   usnmon --startup delayed install")
+    print()
+    print("To edit the diagnostic-log location or other future settings, edit "
+          "%s directly (usnmon respects atomic replace)." % _config_path())
 
 
 # --------------------------------------------------------------------------- #
 # Console / CLI
 # --------------------------------------------------------------------------- #
-def run_console_debug(rotate_period=None):
-    archive_dir = read_archive_dir()
-    setup_logging(True, archive_dir)
+def run_console_debug():
+    """Foreground engine run for interactive debugging. v0.0.9: no archive_dir,
+    no rotate_period."""
+    setup_logging(True)
     if _WINDOWS:
-        register_event_source(archive_dir)
+        register_event_source()
     logger.info("Console debug mode (usnmon). Ctrl+C to stop.")
     stop = threading.Event()
     try:
-        run_engine(stop.is_set, archive_dir, rotate_period)
+        run_engine(stop.is_set)
     except KeyboardInterrupt:
         stop.set()
 
 
-def run_console_test(rotate_period=None):
+def run_console_test():
     """Foreground capture for the test harness: identical to debug (real capture,
     emits 914/100s/915, Ctrl+C/terminate stops cleanly) BUT with console logging
     SUPPRESSED -- screen stays quiet so the test wrapper's output is readable, while
     the usnmon.log file trail is still written. Lets usntest_run.py own the engine as
-    a normal foreground process (no service/SCM, no doubled-engine, killable)."""
-    archive_dir = read_archive_dir()
-    setup_logging(False, archive_dir)      # False = no StreamHandler -> quiet console
+    a normal foreground process (no service/SCM, no doubled-engine, killable).
+
+    v0.0.9: no archive_dir, no rotate_period."""
+    setup_logging(False)                   # False = no StreamHandler -> quiet console
     if _WINDOWS:
-        register_event_source(archive_dir)
+        register_event_source()
     logger.info("Console TEST mode (usnmon). Foreground capture, quiet console.")
     stop = threading.Event()
     try:
-        run_engine(stop.is_set, archive_dir, rotate_period)
+        run_engine(stop.is_set)
     except KeyboardInterrupt:
         stop.set()
 
 
 def main():
     args = sys.argv[1:]
-    # archive_dir override: --archive <path>
-    archive_dir = DEFAULT_ARCHIVE_DIR
-    if "--archive" in args:
-        i = args.index("--archive")
-        archive_dir = args[i + 1]
-        del args[i:i + 2]
-        write_config(archive_dir)
 
-    # --log-interval <N><unit>: rotation cadence. Persisted to config so the SERVICE
-    # honors it too. v0.0.8 unit table: s/m/h (interval), d/w/M/y (CALENDAR, leap-aware),
-    # t (fixed 30-day term). Case-significant: 'm'=minutes, 'M'=calendar months. Size
-    # cap remains active alongside any time leg.
-    rotate_period = None
-    if "--log-interval" in args:
-        i = args.index("--log-interval")
-        spec = args[i + 1] if i + 1 < len(args) else ""
-        del args[i:i + 2]
-        rotate_period = parse_interval(spec)
-        if rotate_period is None:
-            print("Bad --log-interval '%s'. Use e.g. 10m, 90s, 6h, 1d, 2w, 1t, 1M, 1y "
-                  "(case-significant: m=minutes, M=calendar months)." % spec)
-            return
-        cfg = read_config()
-        cfg["rotate_interval"] = spec
-        _write_config_atomic(cfg)
-    else:
-        # Pick up a persisted interval (so the service uses it without a CLI flag).
-        rotate_period = parse_interval(read_config().get("rotate_interval", ""))
-
-    # --legal-retention <N><unit>: prune whole archives older than the term. Units
-    # d/w/t/M/y. BLANK/absent => keep everything forever. Persisted to config so the
-    # SERVICE honors it. Use '--legal-retention ""' (or the config editor) to clear it
-    # back to keep-everything. v0.0.8: 'M' (capital) = calendar months -- the legacy
-    # 'm' (=minutes everywhere else) is NOT valid for retention.
-    if "--legal-retention" in args:
-        i = args.index("--legal-retention")
-        spec = args[i + 1] if i + 1 < len(args) else ""
-        del args[i:i + 2]
-        if spec.strip() and parse_retention(spec) is None:
-            print("Bad --legal-retention '%s'. Use e.g. 25y, 18M, 90d, 18t, 26w "
-                  "(or \"\" to keep everything). 'M' = calendar months (not 'm', "
-                  "which is minutes)." % spec)
-            return
-        cfg = read_config()
-        cfg["legal_retention"] = spec.strip()    # "" => keep everything
-        _write_config_atomic(cfg)
+    # v0.0.9: --archive / --log-interval / --legal-retention removed. Archive
+    # management now lives in logmon. usnmon has no user-configurable rotation
+    # or retention. See USNMON_v0.0.9_EXTRACTION_PLAN.md.
 
     if args and args[0] == "config":
         run_config_editor()
         return
     if args and args[0] == "debug":
-        run_console_debug(rotate_period)
+        run_console_debug()
         return
     if args and args[0] == "test":
-        run_console_test(rotate_period)
+        run_console_test()
         return
-    if args and args[0] == "archive-now":
-        setup_logging(True, read_archive_dir())
-        archive_one(read_archive_dir(), reason="manual")
-        return
+    # v0.0.9: `archive-now` subcommand removed. Archive triggers now live in
+    # logmon.
     if args and args[0] == "check":
-        import json
+        # v0.0.9: repurposed as an engine-health report per extraction plan
+        # section 5.9. Shows service status, config file state, diagnostic log
+        # location, cursors summary, and any config integrity issues.
+        import json as _json
         cfg = {}
+        cfg_ok = True
+        cfg_path = _config_path()
         try:
-            cfg = json.load(open(_config_path()))
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except FileNotFoundError:
+            cfg_ok = False
+        except Exception as exc:
+            cfg_ok = False
+            print("Config parse error: %r" % exc)
+
+        # Service running check.
+        running = "unknown"
+        if _WINDOWS and win32serviceutil is not None:
+            try:
+                status = win32serviceutil.QueryServiceStatus(SERVICE_NAME)
+                running = ("running" if status[1] == win32service.SERVICE_RUNNING
+                           else "stopped")
+            except Exception:
+                running = "not installed"
+
+        log_path = os.path.join(_logs_dir(), DIAG_LOG_NAME)
+        log_size = None
+        try:
+            log_size = os.path.getsize(log_path)
         except Exception:
             pass
-        missing = check_completeness(read_archive_dir(),
-                                     cfg.get("install_month",
-                                             datetime.now().strftime("%Y-%m")))
-        print("Archive dir       :", read_archive_dir())
-        print("Service start type:", cfg.get("service_start_type", "unknown"))
-        print("Missing month-buckets:", missing or "none (complete)")
+
+        print("usnmon engine health")
+        print("-" * 40)
+        print("Service:            %s (%s)" % (SERVICE_NAME, running))
+        print("Service start type: %s" % cfg.get("service_start_type", "unknown"))
+        print("Config file:        %s (%s)"
+              % (cfg_path, "present" if cfg_ok else "missing/unreadable"))
+        print("Diagnostic log:     %s%s"
+              % (log_path,
+                 " (%d bytes)" % log_size if log_size is not None
+                 else " (no log yet)"))
+
+        cursors = cfg.get("cursors", {}) if isinstance(cfg, dict) else {}
+        if not cursors:
+            print("Cursors:            (none -- engine has not yet checkpointed "
+                  "any drive)")
+        else:
+            print("Cursors:            %d drive(s)" % len(cursors))
+            for drive in sorted(cursors.keys()):
+                rec = cursors[drive] if isinstance(cursors[drive], dict) else {}
+                print("  %s journal_id=%s last_usn=%s updated=%s"
+                      % (drive, rec.get("journal_id", "?"),
+                         rec.get("last_usn", "?"),
+                         rec.get("updated", "?")))
+
+        # Any config integrity anomalies (unknown keys, legacy keys, malformed
+        # cursors)?
+        issues = validate_config_integrity(cfg) if isinstance(cfg, dict) else []
+        if issues:
+            print()
+            print("Config anomalies:   %d" % len(issues))
+            for it in issues:
+                print("  - %s" % it)
         return
 
     if _WINDOWS and win32serviceutil is not None:
         # IMPORTANT: pywin32's HandleCommandLine reads sys.argv DIRECTLY, not our local
-        # `args`. Our CLI-only flags (--archive, --log-interval, --legal-retention) were
-        # stripped from `args` above but NOT from sys.argv, so without this sync pywin32
-        # would still see them and reject them as unknown options
-        # ("option --log-interval not recognized"). Rebuild sys.argv from the cleaned
-        # `args` here so the install/update/remove/start/stop dispatch sees only the
-        # flags pywin32 actually understands.
+        # `args`. In v0.0.8a we stripped custom flags before this handoff. v0.0.9 has
+        # no custom flags left, so sys.argv passes through unchanged. Keep the
+        # rebuild for safety in case Pass 2 or a future release reintroduces any.
         sys.argv = [sys.argv[0]] + args
         if not args:
             try:
@@ -2513,10 +1593,10 @@ def main():
         else:
             # Service start type is handled by pywin32's NATIVE --startup flag
             # ([manual|auto|disabled|delayed]), the way Python users already install
-            # services. We don't wrap it. On install we persist archive_dir first, then
-            # let HandleCommandLine do the install (honoring --startup), then read the
-            # ACTUAL configured start type back from Windows and record it in config so
-            # the `config` editor / `check` can report it and the engine can log it.
+            # services. We don't wrap it. On install we let HandleCommandLine do the
+            # install (honoring --startup), then read the ACTUAL configured start
+            # type back from Windows and record it in config so the `config` editor
+            # / `check` can report it and the engine can log it.
             #
             # NOTE on the 'install in args' check (vs args[0] == 'install'): pywin32's
             # --startup flag and its value are passed as separate args BEFORE the verb,
@@ -2526,7 +1606,7 @@ def main():
             # substring scan: no known pywin32 flag takes 'install' as its value.)
             is_install = "install" in args
             if is_install:
-                write_config(archive_dir)
+                write_config()
             win32serviceutil.HandleCommandLine(USNMonitorService)
             if is_install:
                 try:
