@@ -1,3 +1,4 @@
+# This portion of the project has been superseded by the logmon project.  usnmon is strictly a conversion tool.  logmon manages log rotation and archiving.
 v0.3 | 2026-06-20 | Source: usnmon project, YASDC | License: PolyForm Noncommercial 1.0.0
 
 # CHANNEL_HYGIENE.md
